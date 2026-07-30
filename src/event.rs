@@ -149,6 +149,10 @@ pub struct SessionState {
     /// Current context occupancy — a level, not a running total.
     pub context: u64,
     pub last_ts: String,
+    /// Where this session lives, from the register. Absent until a hook has
+    /// reported it, or once the reporting process is gone.
+    pub zellij_session: String,
+    pub pane_id: String,
     pub subagents: BTreeMap<String, SubState>,
 }
 
@@ -273,6 +277,7 @@ impl Snapshot {
                     "last_tool": s.last_tool,
                     "tokens": {"output": s.tokens_out, "context": s.context},
                     "last_activity": s.last_ts,
+                    "pane": {"zellij_session": s.zellij_session, "pane_id": s.pane_id},
                     "subagents": subs,
                 })
             })

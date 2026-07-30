@@ -22,6 +22,7 @@ mod claude;
 mod codex;
 mod discover;
 mod event;
+mod register;
 mod tail;
 
 use discover::Source;
@@ -44,6 +45,7 @@ OPTIONS:
     --interval <MS>   Poll interval (default 300)
     --snapshot <PATH> Where to write state   (default: zellij tmp, else state dir)
     --log <PATH>      Where to append events (default: state dir)
+    --register <PATH> Session->pane registrations (default: state dir)
     --no-publish      Do not write snapshot or log
 ";
 
@@ -72,6 +74,7 @@ struct Opts {
     interval: Duration,
     snapshot: PathBuf,
     log: PathBuf,
+    register: PathBuf,
     publish: bool,
 }
 
@@ -82,6 +85,7 @@ impl Opts {
             interval: Duration::from_millis(300),
             snapshot: default_snapshot_path(),
             log: state_dir().join("events.jsonl"),
+            register: state_dir().join("register.jsonl"),
             publish: true,
         };
         let mut i = 0;
@@ -106,6 +110,11 @@ impl Opts {
                 "--log" => {
                     if let Some(v) = next {
                         o.log = PathBuf::from(v);
+                    }
+                }
+                "--register" => {
+                    if let Some(v) = next {
+                        o.register = PathBuf::from(v);
                     }
                 }
                 "--no-publish" => o.publish = false,
@@ -169,10 +178,13 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     let mut snap = Snapshot::default();
     let stdout = std::io::stdout();
 
-    // On a one-shot scan, replay each file from the start so the snapshot
-    // reflects the whole session. When following, start at the end — otherwise
-    // the first tick replays thousands of historical lines as if they were new.
-    let from_start = !follow;
+    // Always replay from the start: the snapshot is a statement of what is
+    // true now, and an observer that ignored history would show every already
+    // running session as nameless and stateless until it happened to speak.
+    //
+    // The event log is different — it records things happening — so the
+    // backfill pass is folded into state but not published as events.
+    let from_start = true;
     let mut first = true;
 
     loop {
@@ -225,13 +237,30 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             snap.apply(e);
         }
 
-        if opts.publish && !batch.is_empty() {
+        // Registrations are re-read wholesale each pass, then verified against
+        // the live process. A closed pane drops its mapping the same tick.
+        let regs = register::load(&opts.register);
+        for (session, st) in snap.sessions.iter_mut() {
+            match regs.get(session) {
+                Some(p) if register::still_true(p) => {
+                    st.zellij_session = p.zellij_session.clone();
+                    st.pane_id = p.pane_id.clone();
+                }
+                _ => {
+                    st.zellij_session.clear();
+                    st.pane_id.clear();
+                }
+            }
+        }
+
+        // `first` is the backfill pass: real history, but not news.
+        if opts.publish && !batch.is_empty() && !first {
             append_log(&opts.log, &batch);
         }
         if opts.publish && (!batch.is_empty() || first) {
             write_snapshot(&opts.snapshot, &snap);
         }
-        if !print_snapshot {
+        if !print_snapshot && !first {
             let mut out = stdout.lock();
             for e in &batch {
                 let _ = writeln!(out, "{}", e.to_json());
