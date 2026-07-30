@@ -50,6 +50,7 @@ OPTIONS:
     --snapshot <PATH> Where to write state   (default: zellij tmp, else state dir)
     --log <PATH>      Where to append events (default: state dir)
     --register <PATH> Session->pane registrations (default: state dir)
+    --result-ttl <S>  How long a finished subagent's result stays published (90)
     --no-publish      Do not write snapshot or log
 ";
 
@@ -81,6 +82,7 @@ struct Opts {
     log: PathBuf,
     register: PathBuf,
     inbox: PathBuf,
+    result_ttl: Duration,
     publish: bool,
 }
 
@@ -93,6 +95,7 @@ impl Opts {
             log: state_dir().join("events.jsonl"),
             register: state_dir().join("register.jsonl"),
             inbox: hook::default_inbox(&state_dir()),
+            result_ttl: event::RESULT_TTL,
             publish: true,
         };
         let mut i = 0;
@@ -122,6 +125,11 @@ impl Opts {
                 "--register" => {
                     if let Some(v) = next {
                         o.register = PathBuf::from(v);
+                    }
+                }
+                "--result-ttl" => {
+                    if let Some(v) = next.and_then(|v| v.parse::<u64>().ok()) {
+                        o.result_ttl = Duration::from_secs(v);
                     }
                 }
                 "--no-publish" => o.publish = false,
@@ -195,6 +203,8 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     // backfill pass is folded into state but not published as events.
     let from_start = true;
     let mut first = true;
+    // Last text written, so the file is only rewritten when it would differ.
+    let mut published = String::new();
 
     loop {
         // Rediscovery each tick is what makes new sessions appear without
@@ -255,6 +265,8 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             snap.apply(e);
         }
 
+        snap.expire(opts.result_ttl);
+
         // Registrations are re-read wholesale each pass, then verified against
         // the live process. A closed pane drops its mapping the same tick.
         let mut regs = register::load(&opts.register);
@@ -278,8 +290,16 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         if opts.publish && !batch.is_empty() && !first {
             append_log(&opts.log, &batch);
         }
-        if opts.publish && (!batch.is_empty() || first) {
-            write_snapshot(&opts.snapshot, &snap);
+        // Publish on any observable difference, not on "did events arrive".
+        // Expiry and a registration going stale both change what is true while
+        // producing no event, so keying the write off the batch left the file
+        // saying things that had stopped being so.
+        if opts.publish {
+            let txt = serde_json::to_string(&snap.to_json()).unwrap_or_default();
+            if txt != published {
+                write_snapshot(&opts.snapshot, &txt);
+                published = txt;
+            }
         }
         if !print_snapshot && !first {
             let mut out = stdout.lock();
@@ -392,14 +412,11 @@ fn append_log(path: &std::path::Path, batch: &[Event]) {
 
 /// Written via a temp file and renamed, so a subscriber polling the path never
 /// reads a half-written snapshot. The plugin polls this once a second.
-fn write_snapshot(path: &std::path::Path, snap: &Snapshot) {
+fn write_snapshot(path: &std::path::Path, txt: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let tmp = path.with_extension("json.tmp");
-    let Ok(txt) = serde_json::to_string(&snap.to_json()) else {
-        return;
-    };
     if std::fs::write(&tmp, txt).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }

@@ -6,6 +6,13 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+/// How long a finished subagent's result stays published. Expiry lives here
+/// rather than in a subscriber: a subscriber that recomputes "finished" from
+/// each snapshot has no way to know how long ago it happened, so every one of
+/// them would keep the row forever.
+pub const RESULT_TTL: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
 pub enum Kind {
@@ -139,6 +146,8 @@ pub struct SubState {
     pub description: String,
     pub result: String,
     pub state: String,
+    /// When it finished, for expiry. Set once, on the transition.
+    pub done_since: Option<SystemTime>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -208,6 +217,9 @@ impl Snapshot {
                 // label the previous real prompt set.
                 if !text.is_empty() {
                     s.label = text.clone();
+                    // A real new prompt starts a new turn, so last turn's
+                    // finished subagents stop being interesting.
+                    s.subagents.retain(|_, sub| sub.done_since.is_none());
                 }
                 s.state = "working".into();
             }
@@ -254,6 +266,11 @@ impl Snapshot {
                 result,
             } => {
                 let sub = s.subagents.entry(id.clone()).or_default();
+                // Stamp the transition, not every repeat, or the clock resets
+                // each time the same completion is seen and it never expires.
+                if *state == "done" && sub.done_since.is_none() {
+                    sub.done_since = Some(SystemTime::now());
+                }
                 sub.state = state.to_string();
                 if let Some(t) = agent_type {
                     sub.agent_type = t.clone();
@@ -271,6 +288,19 @@ impl Snapshot {
                     }
                 }
             }
+        }
+    }
+
+    /// Drop finished subagents whose results have been published long enough
+    /// to read. Called on the publish tick, so subscribers simply stop seeing
+    /// them rather than each having to age them out.
+    pub fn expire(&mut self, ttl: Duration) {
+        let now = SystemTime::now();
+        for s in self.sessions.values_mut() {
+            s.subagents.retain(|_, sub| match sub.done_since {
+                Some(t) => now.duration_since(t).unwrap_or_default() < ttl,
+                None => true,
+            });
         }
     }
 
