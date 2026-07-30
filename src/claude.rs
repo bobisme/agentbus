@@ -135,6 +135,15 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
     out
 }
 
+/// Where Claude keeps a subagent's sidecar, given the *parent's* transcript:
+/// `<parent minus .jsonl>/subagents/agent-<id>.meta.json`.
+pub fn subagent_meta_path(parent_transcript: &str, agent_id: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "{}/subagents/agent-{agent_id}.jsonl",
+        parent_transcript.trim_end_matches(".jsonl")
+    ))
+}
+
 /// Sidecar Claude writes beside each subagent transcript. Written about a second
 /// after the subagent starts, so an early read legitimately finds nothing.
 pub fn subagent_meta(jsonl: &std::path::Path) -> (String, String) {

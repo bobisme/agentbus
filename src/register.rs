@@ -12,6 +12,10 @@ use std::path::Path;
 pub struct Pane {
     pub zellij_session: String,
     pub pane_id: String,
+    /// The session's own transcript. Claude keeps each subagent's sidecar in a
+    /// directory derived from this path, which is the only place a hook-reported
+    /// subagent's name can be found.
+    pub transcript: String,
     pub pid: u64,
     /// Process start time, which makes the pid unambiguous across reuse.
     pub starttime: u64,
@@ -44,6 +48,7 @@ pub fn load(path: &Path) -> BTreeMap<String, Pane> {
             Pane {
                 zellij_session: s("zellij_session"),
                 pane_id: s("pane_id"),
+                transcript: s("transcript"),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
                 starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),
                 },

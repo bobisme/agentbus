@@ -199,6 +199,10 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     let mut snap = Snapshot::default();
     // Pane bindings reported through the inbox by agents with no transcript.
     let mut inbox_panes: BTreeMap<String, register::Pane> = BTreeMap::new();
+    // Registrations from the previous pass, so the sidecar lookup knows each
+    // session's transcript, plus bounded attempt counts per subagent.
+    let mut regs_prev: BTreeMap<String, register::Pane> = BTreeMap::new();
+    let mut meta_tries: BTreeMap<String, u32> = BTreeMap::new();
     let stdout = std::io::stdout();
 
     // Always replay from the start: the snapshot is a statement of what is
@@ -272,11 +276,18 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             snap.apply(e);
         }
 
+        // Name subagents the hooks reported but could not name: Claude's
+        // SubagentStart payload carries no agent_type or description, and the
+        // subagent's own transcript may already have aged out of the window.
+        // The sidecar beside the parent's transcript always has both.
+        name_subagents(&mut snap, &regs_prev, &mut meta_tries);
+
         snap.expire(opts.result_ttl);
 
         // Registrations are re-read wholesale each pass, then verified against
         // the live process. A closed pane drops its mapping the same tick.
         let mut regs = register::load(&opts.register);
+        regs_prev = regs.clone();
         for (k, v) in &inbox_panes {
             regs.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -473,6 +484,8 @@ fn inbox_events(
             register::Pane {
                 zellij_session: g("zellij_session"),
                 pane_id,
+                // Reports carry no transcript; only a registration knows it.
+                transcript: String::new(),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
                 starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),
             },
@@ -506,5 +519,55 @@ fn inbox_events(
             mk(Kind::Reported { state: st, detail })
         }
         _ => Vec::new(),
+    }
+}
+
+/// How many passes to keep looking for a subagent's sidecar before giving up.
+/// Claude writes it about a second after the start hook fires, so it must be
+/// retried — but a subagent that never gets one must not be stat'd forever.
+const META_TRIES: u32 = 60;
+
+/// Fill in names for subagents that were reported but not described.
+///
+/// Claude's SubagentStart payload carries neither `agent_type` nor
+/// `description`; the old shell hook forked a background poller to chase the
+/// sidecar, which is exactly the kind of work an observer should be doing
+/// instead. The subagent's own transcript also carries it, but only while that
+/// file is still inside the recency window — the sidecar is reachable from the
+/// parent's transcript path regardless of age.
+fn name_subagents(
+    snap: &mut Snapshot,
+    regs: &BTreeMap<String, register::Pane>,
+    tries: &mut BTreeMap<String, u32>,
+) {
+    for (session, st) in snap.sessions.iter_mut() {
+        // Codex names its subagents from its own rollout; this layout is
+        // Claude's, so looking there for anything else just burns syscalls.
+        if st.source != "claude" {
+            continue;
+        }
+        let Some(pane) = regs.get(session) else {
+            continue;
+        };
+        if pane.transcript.is_empty() {
+            continue;
+        }
+        for (id, sub) in st.subagents.iter_mut() {
+            if !sub.agent_type.is_empty() && !sub.description.is_empty() {
+                continue;
+            }
+            let n = tries.entry(format!("{session}/{id}")).or_insert(0);
+            if *n >= META_TRIES {
+                continue;
+            }
+            *n += 1;
+            let (t, d) = claude::subagent_meta(&claude::subagent_meta_path(&pane.transcript, id));
+            if !t.is_empty() {
+                sub.agent_type = t;
+            }
+            if !d.is_empty() {
+                sub.description = d;
+            }
+        }
     }
 }
