@@ -82,6 +82,9 @@ struct Opts {
     log: PathBuf,
     register: PathBuf,
     inbox: PathBuf,
+    /// Set when --snapshot was given, which pins the path instead of letting it
+    /// follow zellij appearing later.
+    snapshot_pinned: bool,
     result_ttl: Duration,
     publish: bool,
 }
@@ -92,6 +95,7 @@ impl Opts {
             within: Duration::from_secs(30 * 60),
             interval: Duration::from_millis(300),
             snapshot: default_snapshot_path(),
+            snapshot_pinned: false,
             log: state_dir().join("events.jsonl"),
             register: state_dir().join("register.jsonl"),
             inbox: hook::default_inbox(&state_dir()),
@@ -115,6 +119,7 @@ impl Opts {
                 "--snapshot" => {
                     if let Some(v) = next {
                         o.snapshot = PathBuf::from(v);
+                        o.snapshot_pinned = true;
                     }
                 }
                 "--log" => {
@@ -156,17 +161,17 @@ fn state_dir() -> PathBuf {
 /// snapshot written to `/tmp/zellij-<uid>/agentbus.json` is readable from inside
 /// the WASI sandbox as `/tmp/agentbus.json` — the one channel that reaches herd
 /// without any push machinery.
+///
+/// Resolved by uid rather than by scanning /tmp, and re-resolved on each publish
+/// rather than once at startup: run as a login service this process usually
+/// starts before zellij does, and a path decided once would be wrong for the
+/// rest of the session.
 fn default_snapshot_path() -> PathBuf {
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
-        for e in entries.flatten() {
-            let p = e.path();
-            let is_zellij = p
-                .file_name()
-                .map(|n| n.to_string_lossy().starts_with("zellij-"))
-                .unwrap_or(false);
-            if is_zellij && p.is_dir() {
-                return p.join("agentbus.json");
-            }
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(md) = std::fs::metadata("/proc/self") {
+        let dir = PathBuf::from(format!("/tmp/zellij-{}", md.uid()));
+        if dir.is_dir() {
+            return dir.join("agentbus.json");
         }
     }
     state_dir().join("snapshot.json")
@@ -205,6 +210,7 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     let mut first = true;
     // Last text written, so the file is only rewritten when it would differ.
     let mut published = String::new();
+    let mut last_target = PathBuf::new();
 
     loop {
         // Rediscovery each tick is what makes new sessions appear without
@@ -296,9 +302,15 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         // saying things that had stopped being so.
         if opts.publish {
             let txt = serde_json::to_string(&snap.to_json()).unwrap_or_default();
-            if txt != published {
-                write_snapshot(&opts.snapshot, &txt);
+            let target = if opts.snapshot_pinned {
+                opts.snapshot.clone()
+            } else {
+                default_snapshot_path()
+            };
+            if txt != published || target != last_target {
+                write_snapshot(&target, &txt);
                 published = txt;
+                last_target = target;
             }
         }
         if !print_snapshot && !first {
@@ -451,6 +463,7 @@ fn inbox_events(
                 zellij_session: g("zellij_session"),
                 pane_id,
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
+                starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),
             },
         );
     }

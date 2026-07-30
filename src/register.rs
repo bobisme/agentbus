@@ -13,6 +13,8 @@ pub struct Pane {
     pub zellij_session: String,
     pub pane_id: String,
     pub pid: u64,
+    /// Process start time, which makes the pid unambiguous across reuse.
+    pub starttime: u64,
 }
 
 /// Read every registration, newest wins. Re-read in full rather than tailed:
@@ -43,15 +45,24 @@ pub fn load(path: &Path) -> BTreeMap<String, Pane> {
                 zellij_session: s("zellij_session"),
                 pane_id: s("pane_id"),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
+                starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),
                 },
         );
     }
     out
 }
 
-/// A registration holds while the agent process is alive *and* its environment
-/// still names that pane. Exact rather than heuristic — no TTL, and no chance of
-/// pointing at a pane that was closed and its id reused by something else.
+/// A registration holds while the exact process that made it is still alive.
+///
+/// Identity is pid + start time, not pid alone: a recycled pid cannot have the
+/// same start time, so this cannot end up pointing at an unrelated process. And
+/// since a process does not move between panes, "same process still running" is
+/// sufficient to keep believing where it lives.
+///
+/// This deliberately does not read /proc/<pid>/environ, which would confirm the
+/// pane directly. That requires ptrace access, and under ptrace_scope=1 only a
+/// descendant of the agent has it — so it works when run by hand from inside the
+/// pane and fails as a background service, which is how this is actually run.
 pub fn still_true(p: &Pane) -> bool {
     if p.pid == 0 {
         // No pid resolved, so liveness cannot be checked. Keep it: a mapping
@@ -59,21 +70,17 @@ pub fn still_true(p: &Pane) -> bool {
         // for panes it cannot see anyway.
         return true;
     }
-    let env_path = format!("/proc/{}/environ", p.pid);
-    let Ok(raw) = std::fs::read(&env_path) else {
+    let Ok(txt) = std::fs::read_to_string(format!("/proc/{}/stat", p.pid)) else {
         return false;
     };
-    let mut pane_ok = p.pane_id.is_empty();
-    let mut sess_ok = p.zellij_session.is_empty();
-    for entry in raw.split(|b| *b == 0) {
-        let Ok(kv) = std::str::from_utf8(entry) else {
-            continue;
-        };
-        if let Some(v) = kv.strip_prefix("ZELLIJ_PANE_ID=") {
-            pane_ok = v == p.pane_id;
-        } else if let Some(v) = kv.strip_prefix("ZELLIJ_SESSION_NAME=") {
-            sess_ok = v == p.zellij_session;
-        }
+    if p.starttime == 0 {
+        // Registered before start time was recorded; liveness alone is all we
+        // can check for it.
+        return true;
     }
-    pane_ok && sess_ok
+    txt.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|t| t == p.starttime)
+        .unwrap_or(false)
 }

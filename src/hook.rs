@@ -89,15 +89,32 @@ fn ppid_of(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Field 22 of /proc/<pid>/stat: the process start time, in clock ticks since
+/// boot. Pairing it with the pid makes the identity exact — a recycled pid
+/// cannot have the same start time — and unlike /proc/<pid>/environ it is
+/// world-readable, so a daemon can check it. environ requires ptrace access,
+/// which under ptrace_scope=1 only a descendant of the agent has.
+fn starttime(pid: u32) -> u64 {
+    let Ok(txt) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0;
+    };
+    // comm can contain spaces and parens, so count fields only after the last
+    // ')': what follows is state, ppid, ... and start time is the 20th of those.
+    txt.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 fn cmdline(pid: u32) -> String {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
         .unwrap_or_default()
 }
 
-/// Walk up to the agent process itself. Recording its pid is what lets the
-/// observer decide staleness exactly — the mapping holds while that process
-/// lives and its environment still names the pane — rather than with a timeout.
+/// Walk up to the agent process itself. Recording its pid, paired with its
+/// start time, is what lets the observer decide staleness exactly — the mapping
+/// holds while that exact process lives — rather than with a timeout.
 fn agent_pid() -> u32 {
     let mut pid = std::os::unix::process::parent_id();
     for _ in 0..8 {
@@ -135,12 +152,14 @@ fn register_session(p: &Value, register: &Path) {
     if session.is_empty() {
         return;
     }
+    let pid = agent_pid();
     let line = json!({
         "session_id": session,
         "transcript": s(p, "transcript_path"),
         "zellij_session": env("ZELLIJ_SESSION_NAME"),
         "pane_id": pane,
-        "pid": agent_pid(),
+        "pid": pid,
+        "starttime": starttime(pid),
     });
     append(register, &line.to_string());
 }
@@ -175,6 +194,7 @@ fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path) {
         return;
     }
     let zs = env("ZELLIJ_SESSION_NAME");
+    let pid = agent_pid();
     // Such an agent has no transcript and therefore no session id of its own.
     // Synthesising one from the pane keeps it a first-class row without
     // pretending it was observed.
@@ -189,7 +209,8 @@ fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path) {
         "detail": clean(detail.map(|d| d.as_str()).unwrap_or(""), 60),
         "zellij_session": zs,
         "pane_id": pane,
-        "pid": agent_pid(),
+        "pid": pid,
+        "starttime": starttime(pid),
     });
     append(inbox, &line.to_string());
 }
