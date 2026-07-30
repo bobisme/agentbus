@@ -1,0 +1,199 @@
+//! `agentbus hook <event>` — the publisher side, invoked by agents directly.
+//!
+//! This replaces a set of shell hooks. Those needed `jq` and `zellij` on PATH
+//! and silently did nothing when either was missing, spawned several processes
+//! per invocation, and forked a background poller to chase a file that the
+//! observer already reads. A hook fires on every prompt and every subagent, so
+//! that cost is paid constantly.
+//!
+//! Hooks publish onto the bus; they never talk to zellij. Two destinations,
+//! because the two kinds of report have different truth semantics:
+//!
+//!   register.jsonl — idempotent facts (this session lives in this pane),
+//!                    re-read wholesale, so truncation is harmless.
+//!   inbox.jsonl    — events (a subagent started), tailed like a transcript.
+//!
+//! Every path exits 0. A monitoring hook must never be able to wedge an agent.
+
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+/// Appends of this size or less are atomic under O_APPEND on Linux, which is
+/// what lets several agents write one file with no locking. Every line is
+/// clamped to stay below it.
+const ATOMIC_LIMIT: usize = 4096;
+
+pub fn run(args: &[String], register: &Path, inbox: &Path) {
+    let event = args.first().map(|s| s.as_str()).unwrap_or("");
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+
+    match event {
+        "register" => register_session(&payload, register),
+        "subagent" => subagent(&payload, args.get(1).map(|s| s.as_str()), inbox),
+        "state" => state(&payload, args.get(1).map(|s| s.as_str()), args.get(2), inbox),
+        _ => {}
+    }
+}
+
+fn s(v: &Value, k: &str) -> String {
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn env(k: &str) -> String {
+    std::env::var(k).unwrap_or_default()
+}
+
+/// Collapse to one line and clamp, so the record stays atomically appendable
+/// and cannot corrupt the lines around it. Control characters are removed
+/// rather than escaped: this text ends up rendered in a terminal pane.
+fn clean(v: &str, max: usize) -> String {
+    let out: String = v
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.chars().count() > max {
+        out.chars().take(max).collect()
+    } else {
+        out
+    }
+}
+
+fn append(path: &Path, line: &str) {
+    if line.len() > ATOMIC_LIMIT {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// /proc/<pid>/stat's comm field can contain spaces and parens, so fields
+/// cannot be counted from the left; everything after the last ')' is fixed.
+fn ppid_of(pid: u32) -> Option<u32> {
+    let txt = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = txt.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn cmdline(pid: u32) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+        .unwrap_or_default()
+}
+
+/// Walk up to the agent process itself. Recording its pid is what lets the
+/// observer decide staleness exactly — the mapping holds while that process
+/// lives and its environment still names the pane — rather than with a timeout.
+fn agent_pid() -> u32 {
+    let mut pid = std::os::unix::process::parent_id();
+    for _ in 0..8 {
+        let c = cmdline(pid);
+        if c.is_empty() {
+            break;
+        }
+        let names_agent = ["claude", "codex", "opencode"]
+            .iter()
+            .any(|n| c.contains(n));
+        // Skip our own command line, which names an agent only because this
+        // binary is invoked from an agent's hook configuration.
+        if names_agent && !c.contains("agentbus") {
+            return pid;
+        }
+        match ppid_of(pid) {
+            Some(p) if p != 0 && p != pid => pid = p,
+            _ => break,
+        }
+    }
+    0
+}
+
+fn register_session(p: &Value, register: &Path) {
+    let pane = env("ZELLIJ_PANE_ID");
+    if pane.is_empty() {
+        return;
+    }
+    // A subagent shares its parent's pane and must not register as a session of
+    // its own; it already appears nested under the parent.
+    if !s(p, "agent_id").is_empty() {
+        return;
+    }
+    let session = s(p, "session_id");
+    if session.is_empty() {
+        return;
+    }
+    let line = json!({
+        "session_id": session,
+        "transcript": s(p, "transcript_path"),
+        "zellij_session": env("ZELLIJ_SESSION_NAME"),
+        "pane_id": pane,
+        "pid": agent_pid(),
+    });
+    append(register, &line.to_string());
+}
+
+fn subagent(p: &Value, phase: Option<&str>, inbox: &Path) {
+    let agent_id = s(p, "agent_id");
+    let session = s(p, "session_id");
+    if agent_id.is_empty() || session.is_empty() {
+        return;
+    }
+    // No description chase here, deliberately. Claude writes the sidecar about a
+    // second after this fires; the observer reads that file itself, so waiting
+    // would only delay the agent to learn something already being watched.
+    let line = json!({
+        "kind": "subagent",
+        "session": session,
+        "agent_id": agent_id,
+        "event": if phase == Some("stop") { "stop" } else { "start" },
+        "agent_type": s(p, "agent_type"),
+        "description": clean(&s(p, "description"), 120),
+        "result": clean(&s(p, "last_assistant_message"), 160),
+    });
+    append(inbox, &line.to_string());
+}
+
+/// Report from an agent whose state cannot be read off disk — currently
+/// OpenCode, whose plugin API sees transitions that reach no transcript.
+fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path) {
+    let pane = env("ZELLIJ_PANE_ID");
+    let Some(st) = st else { return };
+    if pane.is_empty() {
+        return;
+    }
+    let zs = env("ZELLIJ_SESSION_NAME");
+    // Such an agent has no transcript and therefore no session id of its own.
+    // Synthesising one from the pane keeps it a first-class row without
+    // pretending it was observed.
+    let session = match s(p, "session_id") {
+        x if !x.is_empty() => x,
+        _ => format!("pane:{zs}/{pane}"),
+    };
+    let line = json!({
+        "kind": "state",
+        "session": session,
+        "state": st,
+        "detail": clean(detail.map(|d| d.as_str()).unwrap_or(""), 60),
+        "zellij_session": zs,
+        "pane_id": pane,
+        "pid": agent_pid(),
+    });
+    append(inbox, &line.to_string());
+}
+
+pub fn default_inbox(state_dir: &Path) -> PathBuf {
+    state_dir.join("inbox.jsonl")
+}

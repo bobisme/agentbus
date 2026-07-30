@@ -37,6 +37,10 @@ pub enum Kind {
         output_cumulative: bool,
         context: u64,
     },
+    /// State asserted by an agent's own integration, for agents whose state
+    /// reaches no file we can read. Unlike the derived states this may say
+    /// "blocked", which no transcript ever records.
+    Reported { state: String, detail: String },
     Subagent {
         id: String,
         state: &'static str,
@@ -74,6 +78,11 @@ impl Event {
                 if let Some(m) = model {
                     o.insert("model".into(), json!(m));
                 }
+            }
+            Kind::Reported { state, detail } => {
+                o.insert("kind".into(), json!("reported"));
+                o.insert("state".into(), json!(state));
+                o.insert("detail".into(), json!(detail));
             }
             Kind::Prompt { text } => {
                 o.insert("kind".into(), json!("prompt"));
@@ -144,6 +153,9 @@ pub struct SessionState {
     pub cwd: String,
     pub model: String,
     pub last_tool: String,
+    /// Free text accompanying a reported state, e.g. what permission is being
+    /// asked for.
+    pub detail: String,
     /// Cumulative tokens generated this session.
     pub tokens_out: u64,
     /// Current context occupancy — a level, not a running total.
@@ -200,6 +212,20 @@ impl Snapshot {
                 s.state = "working".into();
             }
             Kind::TurnEnd { .. } => s.state = "idle".into(),
+            Kind::Reported { state, detail } => {
+                // Integrations still say "done" when a turn ends. That is the
+                // idle case — finished, awaiting whatever you ask next — so it
+                // is normalised here rather than leaking a fourth state onto
+                // the bus for every subscriber to special-case.
+                if !state.is_empty() {
+                    s.state = if state == "done" {
+                        "idle".to_string()
+                    } else {
+                        state.clone()
+                    };
+                }
+                s.detail = detail.clone();
+            }
             Kind::Tool { name } => {
                 s.last_tool = name.clone();
                 s.state = "working".into();
@@ -275,6 +301,7 @@ impl Snapshot {
                     "cwd": s.cwd,
                     "model": s.model,
                     "last_tool": s.last_tool,
+                    "detail": s.detail,
                     "tokens": {"output": s.tokens_out, "context": s.context},
                     "last_activity": s.last_ts,
                     "pane": {"zellij_session": s.zellij_session, "pane_id": s.pane_id},

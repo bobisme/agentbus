@@ -22,11 +22,12 @@ mod claude;
 mod codex;
 mod discover;
 mod event;
+mod hook;
 mod register;
 mod tail;
 
 use discover::Source;
-use event::{Event, Snapshot};
+use event::{Event, Kind, Snapshot};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -39,6 +40,9 @@ USAGE:
     agentbus watch              Follow live transcripts and publish
     agentbus scan               Fold recent history once, print the snapshot
     agentbus events             Follow and print events to stdout only
+    agentbus hook register      Publish this session's pane (from a hook)
+    agentbus hook subagent start|stop
+    agentbus hook state <state> [detail]
 
 OPTIONS:
     --within <MINS>   How recently a transcript must have changed (default 30)
@@ -57,6 +61,7 @@ fn main() {
     }
     let opts = Opts::parse(&args);
     match args[0].as_str() {
+        "hook" => hook::run(&args[1..], &opts.register, &opts.inbox),
         "watch" => run(&opts, true, true),
         "events" => run(&opts, true, false),
         "scan" => run(&opts, false, true),
@@ -75,6 +80,7 @@ struct Opts {
     snapshot: PathBuf,
     log: PathBuf,
     register: PathBuf,
+    inbox: PathBuf,
     publish: bool,
 }
 
@@ -86,6 +92,7 @@ impl Opts {
             snapshot: default_snapshot_path(),
             log: state_dir().join("events.jsonl"),
             register: state_dir().join("register.jsonl"),
+            inbox: hook::default_inbox(&state_dir()),
             publish: true,
         };
         let mut i = 0;
@@ -176,6 +183,8 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     let mut tails = tail::MultiTail::default();
     let mut streams: BTreeMap<PathBuf, Stream> = BTreeMap::new();
     let mut snap = Snapshot::default();
+    // Pane bindings reported through the inbox by agents with no transcript.
+    let mut inbox_panes: BTreeMap<String, register::Pane> = BTreeMap::new();
     let stdout = std::io::stdout();
 
     // Always replay from the start: the snapshot is a statement of what is
@@ -200,10 +209,19 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             tails.track(&f.path, from_start);
             streams.insert(f.path.clone(), new_stream(f));
         }
+        live.push(opts.inbox.clone());
         tails.drop_untracked(&live);
         streams.retain(|p, _| live.contains(p));
 
+        // The inbox is tailed like a transcript: agents that cannot be read off
+        // disk publish here, and so do reports no transcript carries.
+        tails.track(&opts.inbox, true);
         let mut batch: Vec<Event> = Vec::new();
+        for line in tails.poll(&opts.inbox) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                batch.extend(inbox_events(&v, &mut inbox_panes));
+            }
+        }
         for path in &live {
             let Some(st) = streams.get_mut(path) else {
                 continue;
@@ -239,7 +257,10 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
 
         // Registrations are re-read wholesale each pass, then verified against
         // the live process. A closed pane drops its mapping the same tick.
-        let regs = register::load(&opts.register);
+        let mut regs = register::load(&opts.register);
+        for (k, v) in &inbox_panes {
+            regs.entry(k.clone()).or_insert_with(|| v.clone());
+        }
         for (session, st) in snap.sessions.iter_mut() {
             match regs.get(session) {
                 Some(p) if register::still_true(p) => {
@@ -381,5 +402,68 @@ fn write_snapshot(path: &std::path::Path, snap: &Snapshot) {
     };
     if std::fs::write(&tmp, txt).is_ok() {
         let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Translate an inbox record into normalised events.
+///
+/// These come from agents rather than from disk, so they are reports rather
+/// than observations — but they carry exactly what the transcripts cannot: a
+/// subagent's completion and result, and the state of an agent that writes no
+/// transcript we can read.
+fn inbox_events(
+    v: &serde_json::Value,
+    panes: &mut BTreeMap<String, register::Pane>,
+) -> Vec<Event> {
+    let g = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let session = g("session");
+    if session.is_empty() {
+        return Vec::new();
+    }
+    // A report may be the only thing that knows where this agent lives.
+    let pane_id = g("pane_id");
+    if !pane_id.is_empty() {
+        panes.insert(
+            session.clone(),
+            register::Pane {
+                zellij_session: g("zellij_session"),
+                pane_id,
+                pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
+            },
+        );
+    }
+    let mk = |kind: Kind| {
+        vec![Event {
+            ts: String::new(),
+            source: "hook",
+            session: session.clone(),
+            kind,
+        }]
+    };
+    match g("kind").as_str() {
+        "subagent" => {
+            let stopped = g("event") == "stop";
+            mk(Kind::Subagent {
+                id: g("agent_id"),
+                // "done" is meaningful for a subagent even though it is not for
+                // a session: a stopped subagent is over, not merely between
+                // prompts, and it has a final result.
+                state: if stopped { "done" } else { "working" },
+                agent_type: Some(g("agent_type")),
+                description: Some(g("description")),
+                result: Some(g("result")),
+            })
+        }
+        "state" => {
+            let st = g("state");
+            let detail = g("detail");
+            mk(Kind::Reported { state: st, detail })
+        }
+        _ => Vec::new(),
     }
 }
