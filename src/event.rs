@@ -27,6 +27,10 @@ pub enum Kind {
     },
     /// The user asked for something. Doubles as the start-of-turn signal.
     Prompt { text: String },
+    /// What the current task is, with no claim about the turn. Claude restates
+    /// the last prompt *after* the turn-end record, so treating that restatement
+    /// as a new turn left every session pinned to "working" forever.
+    Label { text: String },
     TurnEnd {
         duration_ms: Option<u64>,
         result: Option<String>,
@@ -93,6 +97,10 @@ impl Event {
             }
             Kind::Prompt { text } => {
                 o.insert("kind".into(), json!("prompt"));
+                o.insert("text".into(), json!(text));
+            }
+            Kind::Label { text } => {
+                o.insert("kind".into(), json!("label"));
                 o.insert("text".into(), json!(text));
             }
             Kind::TurnEnd { duration_ms, result } => {
@@ -223,6 +231,11 @@ impl Snapshot {
                 }
                 s.state = "working".into();
             }
+            Kind::Label { text } => {
+                if !text.is_empty() {
+                    s.label = text.clone();
+                }
+            }
             Kind::TurnEnd { .. } => s.state = "idle".into(),
             Kind::Reported { state, detail } => {
                 // Integrations still say "done" when a turn ends. That is the
@@ -271,7 +284,11 @@ impl Snapshot {
                 if *state == "done" && sub.done_since.is_none() {
                     sub.done_since = Some(SystemTime::now());
                 }
-                sub.state = state.to_string();
+                // An empty state means "no claim" — used by sources that can
+                // name or describe a subagent but do not witness its lifecycle.
+                if !state.is_empty() {
+                    sub.state = state.to_string();
+                }
                 if let Some(t) = agent_type {
                     sub.agent_type = t.clone();
                 }

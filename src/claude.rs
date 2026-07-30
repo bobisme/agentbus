@@ -67,9 +67,12 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
                 }));
             }
         }
+        // Label, not Prompt: this record is written *after* turn_duration, so
+        // reading it as the start of a turn made every finished session look
+        // like it had immediately begun working again.
         "last-prompt" => {
             if let Some(t) = s(v, "lastPrompt") {
-                out.push(mk(Kind::Prompt {
+                out.push(mk(Kind::Label {
                     text: one_line(&t, 160),
                 }));
             }

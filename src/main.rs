@@ -14,9 +14,10 @@
 //! only preopens /host, /data and /tmp, so it can never read ~/.claude or
 //! ~/.codex. That sandbox is the actual reason for the split.
 //!
-//! What this deliberately does NOT do: decide "blocked". Neither agent records
-//! permission prompts to disk — approval is UI state. That signal only exists on
-//! screen, so it stays in the plugin.
+//! What this deliberately does NOT derive: "blocked". Neither agent records
+//! permission prompts to disk — approval is UI state — so it arrives only by
+//! report, through each agent's PermissionRequest hook, or from the screen when
+//! nothing is observing.
 
 mod claude;
 mod codex;
@@ -390,18 +391,28 @@ fn events_for(st: &mut Stream, v: &serde_json::Value) -> Vec<Event> {
             None => claude::normalize(v, &st.fallback),
         },
         Source::Codex => {
-            // Only session_meta carries the session id; every later line would
-            // otherwise fall back to a filename-derived one and show up as a
-            // second, phantom session. Learn it once, then reuse it.
-            if let Some(id) = v.pointer("/payload/session_id").and_then(|x| x.as_str()) {
-                st.fallback = id.to_string();
-            }
-            // A Codex subagent's rollout names itself but not its parent, so a
-            // nickname is all we can attribute without the parent's stream.
-            if let Some(nick) = codex::nickname(v) {
+            // A subagent's rollout must be recognised before anything else reads
+            // session_id off it: that field holds the *parent's* id, so treating
+            // the file as an ordinary session files the subagent's prompts under
+            // the parent and overwrites the parent's label.
+            if let Some((parent, own, nick)) = codex::subagent_of(v) {
+                st.parent = Some(parent);
+                st.agent_id = own;
                 st.description = nick;
+            } else if st.parent.is_none() {
+                // Only session_meta carries the session id; every later line
+                // would otherwise fall back to a filename-derived one and show
+                // up as a second, phantom session. Learn it once, then reuse it.
+                if let Some(id) = v.pointer("/payload/session_id").and_then(|x| x.as_str()) {
+                    st.fallback = id.to_string();
+                }
             }
-            codex::normalize(v, &st.fallback)
+            match &st.parent {
+                Some(parent) => {
+                    codex::normalize_subagent(v, parent, &st.agent_id, &st.description)
+                }
+                None => codex::normalize(v, &st.fallback),
+            }
         }
     }
 }

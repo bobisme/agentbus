@@ -4,10 +4,11 @@
 //! `task_complete` turn boundaries, a running token total, and the final message
 //! carried on the completion event. Schema confirmed against live rollouts.
 //!
-//! Codex subagents get their own rollout file rather than a nested directory,
-//! and it is the subagent's own `session_meta` that names it, via
-//! `agent_nickname`. The file does not record its parent, so a subagent rollout
-//! read in isolation cannot be attributed — see the note in main.rs.
+//! Codex subagents get their own rollout file rather than a nested directory.
+//! Its `session_meta` names it via `agent_nickname` — and records its *parent's*
+//! id in `session_id`, with its own in `id`. That asymmetry is a trap: read the
+//! usual way, a subagent's prompts get filed under the parent and overwrite the
+//! parent's label with whatever the subagent was told to do.
 
 use crate::event::{one_line, Event, Kind};
 use serde_json::Value;
@@ -19,15 +20,69 @@ fn s(v: &Value, k: &str) -> Option<String> {
         .map(|x| x.to_string())
 }
 
-/// Returns the nickname if this rollout belongs to a subagent.
-pub fn nickname(v: &Value) -> Option<String> {
+/// If this line marks a rollout as a subagent's, returns (parent, own id, name).
+///
+/// The trap is that a subagent's `session_meta.payload.session_id` is its
+/// *parent's* id, with its own in a separate `id` field. Reading session_id the
+/// usual way therefore files the subagent's prompts under the parent and
+/// overwrites the parent's label with whatever the subagent was told to do.
+pub fn subagent_of(v: &Value) -> Option<(String, String, String)> {
     if v.get("type").and_then(|x| x.as_str()) != Some("session_meta") {
         return None;
     }
-    v.pointer("/payload/agent_nickname")
-        .and_then(|x| x.as_str())
-        .filter(|x| !x.is_empty())
-        .map(|x| x.to_string())
+    let p = |k: &str| {
+        v.pointer(&format!("/payload/{k}"))
+            .and_then(|x| x.as_str())
+            .filter(|x| !x.is_empty())
+            .map(|x| x.to_string())
+    };
+    let nick = p("agent_nickname")?;
+    Some((p("session_id")?, p("id")?, nick))
+}
+
+/// One line of a subagent's own rollout, reported against its parent.
+///
+/// Never asserts a state: the parent's hooks witness the lifecycle and report
+/// start and stop, and a rollout line arriving afterwards must not un-finish a
+/// subagent that has already completed.
+pub fn normalize_subagent(v: &Value, parent: &str, agent_id: &str, nickname: &str) -> Vec<Event> {
+    let ts = s(v, "timestamp").unwrap_or_default();
+    let mut description = None;
+    let mut result = None;
+
+    if v.get("type").and_then(|x| x.as_str()) != Some("session_meta") {
+        let payload = v.get("payload").unwrap_or(&Value::Null);
+        match payload.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+            // The first user message that is not an XML-ish preamble is the task.
+            "user_message" => {
+                if let Some(t) = s(payload, "message") {
+                    if !t.trim_start().starts_with('<') {
+                        description = Some(one_line(&t, 120));
+                    }
+                }
+            }
+            "task_complete" => {
+                result = s(payload, "last_agent_message").map(|t| one_line(&t, 160));
+            }
+            _ => return Vec::new(),
+        }
+        if description.is_none() && result.is_none() {
+            return Vec::new();
+        }
+    }
+
+    vec![Event {
+        ts,
+        source: "codex",
+        session: parent.to_string(),
+        kind: Kind::Subagent {
+            id: agent_id.to_string(),
+            state: "",
+            agent_type: Some(nickname.to_string()),
+            description,
+            result,
+        },
+    }]
 }
 
 pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
