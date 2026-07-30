@@ -1,0 +1,11 @@
+[package]
+name = "agentbus"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "agentbus"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
