@@ -185,9 +185,14 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
             }));
         }
         "task_complete" => {
+            // Codex is the easy side of this: the completion record carries the
+            // final message in full, and the preview was simply thrown away
+            // afterwards. Both spellings come from the one field.
+            let full = s(payload, "last_agent_message");
             out.push(mk(Kind::TurnEnd {
                 duration_ms: payload.get("duration_ms").and_then(|x| x.as_u64()),
-                result: s(payload, "last_agent_message").map(|t| one_line(&t, 160)),
+                result: full.as_deref().map(|t| one_line(t, 160)),
+                result_full: full,
             }));
         }
         "token_count" => {

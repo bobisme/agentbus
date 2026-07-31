@@ -41,13 +41,25 @@ pub enum Kind {
     Label {
         text: String,
     },
-    /// The turn is over. `result` is the agent's final message, and is carried
-    /// whatever the source: an agent whose end-of-turn record has no text has
-    /// it remembered from the turn instead, so that "what did it say" never
-    /// sends a subscriber off to find and parse a transcript itself.
+    /// The turn is over, carrying the agent's final message whatever the
+    /// source: an agent whose end-of-turn record has no text has it remembered
+    /// from the turn instead, so that "what did it say" never sends a
+    /// subscriber off to find and parse a transcript itself.
+    ///
+    /// Two spellings of the same message, because they have different jobs.
+    /// `result` is a one-line preview for a status renderer, and lossy by
+    /// design. `result_full` is the message, and is what makes the bus a
+    /// transport rather than a status feed — without it every consumer that
+    /// wanted the answer had to locate the transcript, sniff which agent wrote
+    /// it, handle three record shapes, and guard against reading mid-write, all
+    /// to recover text this process had already parsed and thrown away.
     TurnEnd {
         duration_ms: Option<u64>,
+        /// Collapsed to one line and capped. Safe to render anywhere.
         result: Option<String>,
+        /// Untruncated, with its paragraph structure intact. Absent when the
+        /// turn genuinely said nothing.
+        result_full: Option<String>,
     },
     Tool {
         name: String,
@@ -135,6 +147,7 @@ impl Event {
             Kind::TurnEnd {
                 duration_ms,
                 result,
+                result_full,
             } => {
                 o.insert("kind".into(), json!("turn_end"));
                 if let Some(d) = duration_ms {
@@ -142,6 +155,13 @@ impl Event {
                 }
                 if let Some(r) = result {
                     o.insert("result".into(), json!(r));
+                }
+                // Emitted even when identical to the preview. A consumer that
+                // has to check whether the field is present before deciding
+                // which to read is back to special-casing, which is what
+                // carrying it at all was meant to end.
+                if let Some(r) = result_full {
+                    o.insert("result_full".into(), json!(r));
                 }
             }
             Kind::Tool { name } => {

@@ -40,8 +40,13 @@ fn session_of(v: &Value) -> Option<String> {
 /// produced it.
 #[derive(Default)]
 pub struct Turn {
-    /// Most recent non-empty assistant text since the last turn boundary.
+    /// Most recent non-empty assistant text since the last turn boundary,
+    /// collapsed to one line for a status renderer.
     answer: Option<String>,
+    /// The same text, untruncated. Held separately rather than collapsing at
+    /// the end, because collapsing is not reversible — by the time the turn
+    /// closes, the paragraph structure is already gone.
+    answer_full: Option<String>,
 }
 
 /// The text of a `user` record that genuinely starts a turn, if it is one.
@@ -165,6 +170,7 @@ pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Even
                 // interrupted turn never gets a turn_duration, and its
                 // half-answer must not surface as this turn's result.
                 turn.answer = None;
+                turn.answer_full = None;
                 out.push(mk(Kind::Prompt {
                     text: one_line(&t, 160),
                 }));
@@ -179,6 +185,7 @@ pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Even
                     // read, so a turn that says nothing reports nothing instead
                     // of repeating the last turn's answer.
                     result: turn.answer.take(),
+                    result_full: turn.answer_full.take(),
                 }));
             }
         }
@@ -205,11 +212,11 @@ pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Even
                         }
                         // Held rather than published: while the turn is running
                         // this is a running answer, and only the last one before
-                        // turn_duration is the answer. Clamped like every other
-                        // result, so the log line stays atomically appendable.
+                        // turn_duration is the answer.
                         "text" => {
                             if let Some(t) = s(b, "text") {
                                 turn.answer = Some(one_line(&t, 160));
+                                turn.answer_full = Some(t);
                             }
                         }
                         _ => {}
@@ -292,7 +299,13 @@ pub fn normalize_subagent(
         session: parent_session.to_string(),
         kind: Kind::Subagent {
             id: agent_id.to_string(),
-            state: "working",
+            // No state claim, matching the Codex path. The parent's hooks
+            // witness the lifecycle; a transcript line only says something
+            // happened, not that it is still happening. Asserting "working"
+            // here meant any line read after the stop hook — trailing output,
+            // or a replay on restart — flipped a finished subagent back to
+            // running, and it never recovered.
+            state: "",
             agent_type: Some(agent_type.to_string()),
             description: Some(description.to_string()),
             result,
