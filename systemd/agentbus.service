@@ -1,0 +1,32 @@
+[Unit]
+Description=agentbus — observe coding agents, publish normalised events
+# Not After=graphical-session: this has nothing to do with a display, and agents
+# run just as often under a plain ssh login.
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agentbus watch
+
+# The point is to be running whenever an agent is. A crash must not leave
+# subscribers quietly showing stale state, which looks like working software
+# rather than a stopped service.
+Restart=always
+RestartSec=2
+
+# Idle work between file appends. Keep it behind the agents themselves, which
+# are what the user is actually waiting on.
+Nice=10
+IOSchedulingClass=idle
+
+# Deliberately mild. It must read agent transcripts under $HOME and write its
+# own state, and a subscriber may ask for the snapshot in a directory owned by
+# something else. Stricter sandboxing breaks one of those, and the failure mode
+# is a snapshot that silently stops updating — indistinguishable from an idle
+# machine.
+ProtectSystem=full
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=default.target

@@ -1,7 +1,9 @@
 [package]
 name = "agentbus"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
+description = "Observe coding agents, publish normalised events and a state snapshot"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "agentbus"
@@ -9,3 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json = "1"
+
+[profile.release]
+opt-level = 2

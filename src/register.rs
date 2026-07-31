@@ -10,8 +10,10 @@ use std::path::Path;
 
 #[derive(Clone, Debug, Default)]
 pub struct Pane {
-    pub zellij_session: String,
-    pub pane_id: String,
+    /// Which multiplexer, so a subscriber can ignore locations it cannot render.
+    pub mux: String,
+    pub mux_session: String,
+    pub pane: String,
     /// The session's own transcript. Claude keeps each subagent's sidecar in a
     /// directory derived from this path, which is the only place a hook-reported
     /// subagent's name can be found.
@@ -46,8 +48,9 @@ pub fn load(path: &Path) -> BTreeMap<String, Pane> {
         out.insert(
             session,
             Pane {
-                zellij_session: s("zellij_session"),
-                pane_id: s("pane_id"),
+                mux: s("mux"),
+                mux_session: s("mux_session"),
+                pane: s("pane"),
                 transcript: s("transcript"),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
                 starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),

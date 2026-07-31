@@ -10,9 +10,11 @@
 //! more (tools, tokens, titles, turn boundaries), and have no race — we measured
 //! Claude's subagent meta file landing a full second *after* its start hook.
 //!
-//! Why this is a separate process at all: a zellij plugin is WASI-sandboxed and
-//! only preopens /host, /data and /tmp, so it can never read ~/.claude or
-//! ~/.codex. That sandbox is the actual reason for the split.
+//! Why this is a separate process at all: the things that want this information
+//! are usually sandboxed or short-lived — a terminal-multiplexer plugin, a
+//! status bar, a notifier. The first consumer was a zellij plugin, which is
+//! WASI-sandboxed and can never read ~/.claude or ~/.codex itself. Publishing
+//! to a file that anything can read costs nothing and serves all of them.
 //!
 //! What this deliberately does NOT derive: "blocked". Neither agent records
 //! permission prompts to disk — approval is UI state — so it arrives only by
@@ -48,7 +50,7 @@ USAGE:
 OPTIONS:
     --within <MINS>   How recently a transcript must have changed (default 30)
     --interval <MS>   Poll interval (default 300)
-    --snapshot <PATH> Where to write state   (default: zellij tmp, else state dir)
+    --snapshot <PATH> Where to write state   (default: state dir)
     --log <PATH>      Where to append events (default: state dir)
     --register <PATH> Session->pane registrations (default: state dir)
     --result-ttl <S>  How long a finished subagent's result stays published (90)
@@ -83,8 +85,9 @@ struct Opts {
     log: PathBuf,
     register: PathBuf,
     inbox: PathBuf,
-    /// Set when --snapshot was given, which pins the path instead of letting it
-    /// follow zellij appearing later.
+    /// Set when --snapshot was given. A pinned path may point into a directory
+    /// created later by something else, so it is written only once that exists
+    /// rather than being created here.
     snapshot_pinned: bool,
     result_ttl: Duration,
     publish: bool,
@@ -158,23 +161,13 @@ fn state_dir() -> PathBuf {
         .join("agentbus")
 }
 
-/// Prefer zellij's sandboxed tmp: a plugin sees that directory as `/tmp`, so a
-/// snapshot written to `/tmp/zellij-<uid>/agentbus.json` is readable from inside
-/// the WASI sandbox as `/tmp/agentbus.json` — the one channel that reaches herd
-/// without any push machinery.
+/// Where state is published unless told otherwise.
 ///
-/// Resolved by uid rather than by scanning /tmp, and re-resolved on each publish
-/// rather than once at startup: run as a login service this process usually
-/// starts before zellij does, and a path decided once would be wrong for the
-/// rest of the session.
+/// Deliberately somewhere this process owns. A subscriber that can only read a
+/// particular directory — a sandboxed plugin, say — should be given `--snapshot`
+/// pointing there rather than having its location assumed here; knowledge of one
+/// consumer's sandbox does not belong in the publisher.
 fn default_snapshot_path() -> PathBuf {
-    use std::os::unix::fs::MetadataExt;
-    if let Ok(md) = std::fs::metadata("/proc/self") {
-        let dir = PathBuf::from(format!("/tmp/zellij-{}", md.uid()));
-        if dir.is_dir() {
-            return dir.join("agentbus.json");
-        }
-    }
     state_dir().join("snapshot.json")
 }
 
@@ -294,12 +287,14 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         for (session, st) in snap.sessions.iter_mut() {
             match regs.get(session) {
                 Some(p) if register::still_true(p) => {
-                    st.zellij_session = p.zellij_session.clone();
-                    st.pane_id = p.pane_id.clone();
+                    st.mux = p.mux.clone();
+                    st.mux_session = p.mux_session.clone();
+                    st.pane = p.pane.clone();
                 }
                 _ => {
-                    st.zellij_session.clear();
-                    st.pane_id.clear();
+                    st.mux.clear();
+                    st.mux_session.clear();
+                    st.pane.clear();
                 }
             }
         }
@@ -317,15 +312,15 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         let claimed: std::collections::BTreeSet<String> = snap
             .sessions
             .iter()
-            .filter(|(id, st)| !id.starts_with("pane:") && !st.pane_id.is_empty())
-            .map(|(_, st)| format!("{}/{}", st.zellij_session, st.pane_id))
+            .filter(|(id, st)| !id.starts_with("pane:") && !st.pane.is_empty())
+            .map(|(_, st)| format!("{}/{}/{}", st.mux, st.mux_session, st.pane))
             .collect();
         snap.sessions.retain(|id, st| {
             if !id.starts_with("pane:") {
                 return true;
             }
-            !st.pane_id.is_empty()
-                && !claimed.contains(&format!("{}/{}", st.zellij_session, st.pane_id))
+            !st.pane.is_empty()
+                && !claimed.contains(&format!("{}/{}/{}", st.mux, st.mux_session, st.pane))
         });
 
         // `first` is the backfill pass: real history, but not news.
@@ -338,15 +333,11 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         // saying things that had stopped being so.
         if opts.publish {
             let txt = serde_json::to_string(&snap.to_json()).unwrap_or_default();
-            let target = if opts.snapshot_pinned {
-                opts.snapshot.clone()
-            } else {
-                default_snapshot_path()
-            };
-            if txt != published || target != last_target {
-                write_snapshot(&target, &txt);
-                published = txt;
-                last_target = target;
+            if txt != published || last_target.as_os_str().is_empty() {
+                if write_snapshot(&opts.snapshot, &txt, !opts.snapshot_pinned) {
+                    published = txt;
+                    last_target = opts.snapshot.clone();
+                }
             }
         }
         if !print_snapshot && !first {
@@ -470,14 +461,26 @@ fn append_log(path: &std::path::Path, batch: &[Event]) {
 
 /// Written via a temp file and renamed, so a subscriber polling the path never
 /// reads a half-written snapshot. The plugin polls this once a second.
-fn write_snapshot(path: &std::path::Path, txt: &str) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+/// Returns whether the snapshot was written.
+///
+/// `create_dir` is false for a path the caller pinned: that may live in a
+/// directory another program owns and has not created yet — a multiplexer's
+/// runtime dir, for instance — and creating it here would take ownership of
+/// something with its own expectations about permissions. Waiting costs a few
+/// ticks and cannot break anything.
+fn write_snapshot(path: &std::path::Path, txt: &str, create_dir: bool) -> bool {
+    match path.parent() {
+        Some(dir) if create_dir => {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        Some(dir) if !dir.is_dir() => return false,
+        _ => {}
     }
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, txt).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+        return std::fs::rename(&tmp, path).is_ok();
     }
+    false
 }
 
 /// Translate an inbox record into normalised events.
@@ -501,13 +504,14 @@ fn inbox_events(
         return Vec::new();
     }
     // A report may be the only thing that knows where this agent lives.
-    let pane_id = g("pane_id");
-    if !pane_id.is_empty() {
+    let pane = g("pane");
+    if !pane.is_empty() {
         panes.insert(
             session.clone(),
             register::Pane {
-                zellij_session: g("zellij_session"),
-                pane_id,
+                mux: g("mux"),
+                mux_session: g("mux_session"),
+                pane,
                 // Reports carry no transcript; only a registration knows it.
                 transcript: String::new(),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),

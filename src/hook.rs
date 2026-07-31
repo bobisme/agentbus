@@ -58,6 +58,38 @@ fn env(k: &str) -> String {
     std::env::var(k).unwrap_or_default()
 }
 
+/// Where this process is running, as (multiplexer, session, pane).
+///
+/// Every multiplexer exports its own pane identity, so the same walk works for
+/// all of them and a subscriber can ask for the one it renders. Empty pane means
+/// "not in one" — there is then nowhere to attribute the agent to, and the
+/// caller declines to report rather than inventing a location.
+fn location() -> (&'static str, String, String) {
+    let zellij = env("ZELLIJ_PANE_ID");
+    if !zellij.is_empty() {
+        return ("zellij", env("ZELLIJ_SESSION_NAME"), zellij);
+    }
+    let tmux = env("TMUX_PANE");
+    if !tmux.is_empty() {
+        // TMUX is "<socket>,<pid>,<session>"; the last field is the session.
+        let sess = env("TMUX")
+            .rsplit(',')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        return ("tmux", sess, tmux);
+    }
+    let wezterm = env("WEZTERM_PANE");
+    if !wezterm.is_empty() {
+        return ("wezterm", String::new(), wezterm);
+    }
+    let kitty = env("KITTY_WINDOW_ID");
+    if !kitty.is_empty() {
+        return ("kitty", String::new(), kitty);
+    }
+    ("", String::new(), String::new())
+}
+
 /// Collapse to one line and clamp, so the record stays atomically appendable
 /// and cannot corrupt the lines around it. Control characters are removed
 /// rather than escaped: this text ends up rendered in a terminal pane.
@@ -148,7 +180,7 @@ fn agent_pid() -> u32 {
 }
 
 fn register_session(p: &Value, register: &Path) {
-    let pane = env("ZELLIJ_PANE_ID");
+    let (mux, mux_session, pane) = location();
     if pane.is_empty() {
         return;
     }
@@ -165,8 +197,9 @@ fn register_session(p: &Value, register: &Path) {
     let line = json!({
         "session_id": session,
         "transcript": s(p, "transcript_path"),
-        "zellij_session": env("ZELLIJ_SESSION_NAME"),
-        "pane_id": pane,
+        "mux": mux,
+        "mux_session": mux_session,
+        "pane": pane,
         "pid": pid,
         "starttime": starttime(pid),
     });
@@ -197,27 +230,27 @@ fn subagent(p: &Value, phase: Option<&str>, inbox: &Path) {
 /// Report from an agent whose state cannot be read off disk — currently
 /// OpenCode, whose plugin API sees transitions that reach no transcript.
 fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path) {
-    let pane = env("ZELLIJ_PANE_ID");
     let Some(st) = st else { return };
+    let (mux, mux_session, pane) = location();
     if pane.is_empty() {
         return;
     }
-    let zs = env("ZELLIJ_SESSION_NAME");
     let pid = agent_pid();
     // Such an agent has no transcript and therefore no session id of its own.
     // Synthesising one from the pane keeps it a first-class row without
     // pretending it was observed.
     let session = match s(p, "session_id") {
         x if !x.is_empty() => x,
-        _ => format!("pane:{zs}/{pane}"),
+        _ => format!("pane:{mux}/{mux_session}/{pane}"),
     };
     let line = json!({
         "kind": "state",
         "session": session,
         "state": st,
         "detail": clean(detail.map(|d| d.as_str()).unwrap_or(""), 60),
-        "zellij_session": zs,
-        "pane_id": pane,
+        "mux": mux,
+        "mux_session": mux_session,
+        "pane": pane,
         "pid": pid,
         "starttime": starttime(pid),
     });

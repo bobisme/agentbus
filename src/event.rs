@@ -180,8 +180,9 @@ pub struct SessionState {
     pub last_ts: String,
     /// Where this session lives, from the register. Absent until a hook has
     /// reported it, or once the reporting process is gone.
-    pub zellij_session: String,
-    pub pane_id: String,
+    pub mux: String,
+    pub mux_session: String,
+    pub pane: String,
     pub subagents: BTreeMap<String, SubState>,
 }
 
@@ -351,7 +352,7 @@ impl Snapshot {
                     "detail": s.detail,
                     "tokens": {"output": s.tokens_out, "context": s.context},
                     "last_activity": s.last_ts,
-                    "pane": {"zellij_session": s.zellij_session, "pane_id": s.pane_id},
+                    "location": {"mux": s.mux, "session": s.mux_session, "pane": s.pane},
                     "subagents": subs,
                 })
             })
