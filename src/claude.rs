@@ -117,6 +117,7 @@ pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Even
                     title_rank: 2,
                     cwd: None,
                     model: None,
+                    effort: None,
                 }));
             }
         }
@@ -127,6 +128,7 @@ pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Even
                     title_rank: 2,
                     cwd: None,
                     model: None,
+                    effort: None,
                 }));
             }
         }
@@ -137,6 +139,7 @@ pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Even
                     title_rank: 1,
                     cwd: None,
                     model: None,
+                    effort: None,
                 }));
             }
         }
@@ -189,6 +192,7 @@ pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Even
                         .pointer("/message/model")
                         .and_then(|x| x.as_str())
                         .map(|x| x.to_string()),
+                    effort: s(v, "effort"),
                 }));
             }
             if let Some(blocks) = v.pointer("/message/content").and_then(|x| x.as_array()) {
@@ -275,6 +279,13 @@ pub fn normalize_subagent(
     description: &str,
 ) -> Vec<Event> {
     let ts = s(v, "timestamp").unwrap_or_default();
+    // A subagent may be told to run a different model or effort from its
+    // parent, and its own transcript is the only place that says so.
+    let model = v
+        .pointer("/message/model")
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string());
+    let effort = s(v, "effort");
     let mk = |result: Option<String>, tool: Option<String>| Event {
         ts: ts.clone(),
         source: "claude",
@@ -285,6 +296,8 @@ pub fn normalize_subagent(
             agent_type: Some(agent_type.to_string()),
             description: Some(description.to_string()),
             result,
+            model: model.clone(),
+            effort: effort.clone(),
             tool,
         },
     };

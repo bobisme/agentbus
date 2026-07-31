@@ -552,6 +552,8 @@ fn inbox_events(v: &serde_json::Value, panes: &mut BTreeMap<String, register::Pa
                 agent_type: Some(g("agent_type")),
                 description: Some(g("description")),
                 result: Some(g("result")),
+                model: None,
+                effort: None,
                 tool: None,
             })
         }

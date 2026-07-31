@@ -65,6 +65,16 @@ pub fn normalize_subagent(v: &Value, parent: &str, agent_id: &str, nickname: &st
     let mut description = None;
     let mut result = None;
     let mut tool = None;
+    // A subagent's own turn_context names its model and effort, which may
+    // differ from its parent's.
+    let model = v
+        .pointer("/payload/model")
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string());
+    let effort = v
+        .pointer("/payload/effort")
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string());
 
     if v.get("type").and_then(|x| x.as_str()) != Some("session_meta") {
         let payload = v.get("payload").unwrap_or(&Value::Null);
@@ -96,6 +106,8 @@ pub fn normalize_subagent(v: &Value, parent: &str, agent_id: &str, nickname: &st
             agent_type: Some(nickname.to_string()),
             description,
             result,
+            model,
+            effort,
             tool,
         },
     }]
@@ -122,6 +134,7 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
             // the prompt, which is why the label matters more here.
             title: None,
             title_rank: 0,
+            effort: None,
             cwd: v
                 .pointer("/payload/cwd")
                 .and_then(|x| x.as_str())
@@ -142,6 +155,10 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
                 title_rank: 0,
                 cwd: None,
                 model: Some(m.to_string()),
+                effort: v
+                    .pointer("/payload/effort")
+                    .and_then(|x| x.as_str())
+                    .map(|x| x.to_string()),
             }));
         }
         return out;

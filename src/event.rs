@@ -24,6 +24,9 @@ pub enum Kind {
         title_rank: u8,
         cwd: Option<String>,
         model: Option<String>,
+        /// Reasoning effort. Both agents expose it and it changes how a session
+        /// behaves as much as the model does, so it belongs beside it.
+        effort: Option<String>,
     },
     /// The user asked for something. Doubles as the start-of-turn signal, and
     /// every source owes one: a subscriber waiting for `Prompt` then `TurnEnd`
@@ -74,6 +77,10 @@ pub enum Kind {
         agent_type: Option<String>,
         description: Option<String>,
         result: Option<String>,
+        /// A subagent may run a different model or effort from its parent,
+        /// which is exactly when knowing is useful.
+        model: Option<String>,
+        effort: Option<String>,
         /// A tool the subagent just invoked, counted the same way a session's
         /// are. Subagents write their own transcripts, so this is observed
         /// rather than reported.
@@ -154,9 +161,17 @@ impl Event {
                 agent_type,
                 description,
                 result,
+                model,
+                effort,
                 tool,
             } => {
                 o.insert("kind".into(), json!("subagent"));
+                if let Some(m) = model {
+                    o.insert("model".into(), json!(m));
+                }
+                if let Some(e) = effort {
+                    o.insert("effort".into(), json!(e));
+                }
                 if let Some(t) = tool {
                     o.insert("tool".into(), json!(t));
                 }
@@ -183,6 +198,8 @@ pub struct SubState {
     pub description: String,
     pub result: String,
     pub state: String,
+    pub model: String,
+    pub effort: String,
     pub tools: u64,
     pub last_tool: String,
     /// Epoch seconds of the earliest record seen for this subagent. Its start
@@ -203,6 +220,7 @@ pub struct SessionState {
     pub state: String,
     pub cwd: String,
     pub model: String,
+    pub effort: String,
     pub last_tool: String,
     /// Tool calls in the current turn. Per turn rather than per session: the
     /// question a roster answers is "what is it doing now", and a lifetime
@@ -258,6 +276,7 @@ impl Snapshot {
                 title_rank,
                 cwd,
                 model,
+                effort,
             } => {
                 // Only take a title at least as authoritative as what we hold,
                 // so a model-written title can't clobber a user-set one.
@@ -272,6 +291,9 @@ impl Snapshot {
                 }
                 if let Some(m) = model {
                     s.model = m.clone();
+                }
+                if let Some(e) = effort {
+                    s.effort = e.clone();
                 }
             }
             Kind::Prompt { text } => {
@@ -330,9 +352,17 @@ impl Snapshot {
                 agent_type,
                 description,
                 result,
+                model,
+                effort,
                 tool,
             } => {
                 let sub = s.subagents.entry(id.clone()).or_default();
+                if let Some(m) = model {
+                    sub.model = m.clone();
+                }
+                if let Some(e) = effort {
+                    sub.effort = e.clone();
+                }
                 if let Some(t) = tool {
                     sub.tools += 1;
                     sub.last_tool = t.clone();
@@ -402,6 +432,8 @@ impl Snapshot {
                             "agent_type": sub.agent_type,
                             "description": sub.description,
                             "result": sub.result,
+                            "model": sub.model,
+                            "effort": sub.effort,
                             "tools": sub.tools,
                             "last_tool": sub.last_tool,
                             "started": sub.started,
@@ -416,6 +448,7 @@ impl Snapshot {
                     "state": s.state,
                     "cwd": s.cwd,
                     "model": s.model,
+                    "effort": s.effort,
                     "last_tool": s.last_tool,
                     "tools": s.tool_calls,
                     "state_since": s.state_since,
