@@ -21,6 +21,7 @@
 //! report, through each agent's PermissionRequest hook, or from the screen when
 //! nothing is observing.
 
+mod agy;
 mod claude;
 mod codex;
 mod discover;
@@ -284,11 +285,6 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         // disk publish here, and so do reports no transcript carries.
         tails.track(&opts.inbox, true);
         let mut batch: Vec<Event> = Vec::new();
-        for line in tails.poll(&opts.inbox) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                batch.extend(inbox_events(&v, &mut inbox_panes));
-            }
-        }
         for path in &live {
             let Some(st) = streams.get_mut(path) else {
                 continue;
@@ -318,6 +314,25 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
                     }
                     batch.push(e);
                 }
+            }
+        }
+
+        // Reports are folded after observations, not before.
+        //
+        // Within one pass the two are unordered — an inbox record carries no
+        // timestamp — so whichever is applied last decides the state. A report
+        // is the later fact by construction: hooks fire at the moment a thing
+        // happens, while a transcript is read in bulk afterwards, sometimes
+        // hours of it at startup.
+        //
+        // Applying them the other way round made a finished agy session read as
+        // `working` forever after a restart: the backfill replayed its turn_end
+        // from the inbox first, then replayed the prompt that opened that same
+        // turn, and the prompt won. Live it looked right, which is the worst
+        // way for this to be wrong.
+        for line in tails.poll(&opts.inbox) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                batch.extend(inbox_events(&v, &mut inbox_panes));
             }
         }
 
@@ -450,11 +465,17 @@ fn new_stream(f: &discover::Found) -> Stream {
     Stream {
         path: f.path.clone(),
         source: f.source,
-        // Codex filenames are rollout-<ts>-<uuid>; the uuid is the tail.
-        fallback: stem
-            .rsplit_once('-')
-            .map(|(_, id)| id.to_string())
-            .unwrap_or(stem),
+        fallback: match f.source {
+            // Every agy transcript is named `transcript.jsonl`; the id is the
+            // directory it sits under, so a filename-derived one would make
+            // every conversation the same session.
+            Source::Agy => agy::session_of(&f.path),
+            // Codex filenames are rollout-<ts>-<uuid>; the uuid is the tail.
+            _ => stem
+                .rsplit_once('-')
+                .map(|(_, id)| id.to_string())
+                .unwrap_or(stem),
+        },
         parent: f.parent_session.clone(),
         agent_id,
         agent_type,
@@ -504,9 +525,24 @@ fn events_for(st: &mut Stream, v: &serde_json::Value) -> Vec<Event> {
                 None => codex::normalize(v, &st.fallback),
             }
         }
+        // agy names its session nowhere in the transcript, so the id derived
+        // from the path is not a fallback here but the only source.
+        Source::Agy => agy::normalize(v, &st.fallback),
     }
 }
 
+/// Append a batch as a single write.
+///
+/// `writeln!` on a `File` is unbuffered and issues a syscall per format
+/// fragment, so an event's text and its newline reach the file separately. With
+/// one observer that is merely wasteful; with two — which happens by accident, a
+/// stray `agentbus watch` left running beside the service — the fragments
+/// interleave and the log grows lines that are half an event, or just `}`.
+/// Nothing reports an error, because nothing was reading it closely enough to
+/// notice. `agentbus wait` now does.
+///
+/// Building the batch and issuing one `write` makes the append atomic under
+/// O_APPEND, so a second writer can at worst interleave whole batches.
 fn append_log(path: &std::path::Path, batch: &[Event]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -613,8 +649,62 @@ fn inbox_events(v: &serde_json::Value, panes: &mut BTreeMap<String, register::Pa
             let detail = g("detail");
             mk(Kind::Reported { state: st, detail })
         }
+        // Identity for a host whose transcript carries none, reported at the
+        // start of a turn so the session is named while it works rather than
+        // only once it has finished.
+        "session" => identity_event(&session, &g("cwd"), &g("model")),
+        // The end of a turn, for a host that records it nowhere. The report
+        // carries the boundary and the transcript that holds the answer, never
+        // the answer itself: an inbox line is dropped whole above the atomic
+        // append limit, which would lose exactly the long answers worth having,
+        // and lose them without a sound. Reading the file here has neither
+        // problem, and the observer is already reading it anyway.
+        "turn_end" => {
+            let (result, result_full) = match g("transcript") {
+                t if t.is_empty() => (None, None),
+                t => agy::last_answer(&agy::transcript_path(&t)),
+            };
+            // Identity rides along because it is the only place agy publishes
+            // it: its transcript names neither the working directory nor the
+            // model, and both arrive on every hook payload for free.
+            let mut out = identity_event(&session, &g("cwd"), &g("model"));
+            out.push(Event {
+                ts: String::new(),
+                source: "hook",
+                session,
+                kind: Kind::TurnEnd {
+                    duration_ms: v.get("duration_ms").and_then(|x| x.as_u64()),
+                    result,
+                    result_full,
+                },
+            });
+            out
+        }
         _ => Vec::new(),
     }
+}
+
+/// A reported `cwd`/`model`, as an event — or nothing, when neither was sent.
+///
+/// Empty rather than a single `Kind::Session`, because publishing one with both
+/// fields `None` would restate identity on every turn and fill the log with
+/// events that say nothing.
+fn identity_event(session: &str, cwd: &str, model: &str) -> Vec<Event> {
+    if cwd.is_empty() && model.is_empty() {
+        return Vec::new();
+    }
+    vec![Event {
+        ts: String::new(),
+        source: "hook",
+        session: session.to_string(),
+        kind: Kind::Session {
+            title: None,
+            title_rank: 0,
+            cwd: (!cwd.is_empty()).then(|| cwd.to_string()),
+            model: (!model.is_empty()).then(|| model.to_string()),
+            effort: None,
+        },
+    }]
 }
 
 /// How many passes to keep looking for a subagent's sidecar before giving up.

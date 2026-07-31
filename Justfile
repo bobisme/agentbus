@@ -33,6 +33,34 @@ sync-opencode:
     cp integrations/opencode.js ~/.config/opencode/plugin/agentbus.js
     @echo "synced into ~/.config/opencode/plugin/agentbus.js"
 
+agy_hooks := env("HOME") / ".gemini/config/hooks.json"
+
+# agy's global hooks file is ~/.gemini/config/hooks.json — established by
+# tracing its syscalls, since its own documentation says only "your
+# customization root". It probes four paths and opens that one. `.agents/` is a
+# customization root for skills and rules; it is NOT read for hooks, at any
+# level, which is a trap because putting hooks.json there looks right and fails
+# silently.
+#
+# The binary path is substituted rather than left as `~`: agy's docs say it
+# expands one, and it does not. That failure is silent too — the hook simply
+# never runs and nothing anywhere says so.
+#
+# Top-level keys are hook names and are merged, so agentbus sits beside anyone
+# else's entry, which is why this will not overwrite a file it did not write.
+
+# Install the agy (Antigravity CLI) hooks, for every project at once.
+sync-agy:
+    @mkdir -p "$(dirname "{{ agy_hooks }}")"
+    @if [ -e "{{ agy_hooks }}" ] && ! grep -q '"agentbus"' "{{ agy_hooks }}"; then \
+        echo "{{ agy_hooks }} exists and has no agentbus entry."; \
+        echo "Merge this in as a top-level key rather than replacing the file:"; \
+        echo; sed "s|__AGENTBUS__|{{ prefix }}/bin/agentbus|g" integrations/agy-hooks.json; exit 1; \
+     else \
+        sed "s|__AGENTBUS__|{{ prefix }}/bin/agentbus|g" integrations/agy-hooks.json > "{{ agy_hooks }}"; \
+        echo "synced into {{ agy_hooks }}"; \
+     fi
+
 # Run in the foreground.
 watch *ARGS:
     cargo run --release -- watch {{ ARGS }}

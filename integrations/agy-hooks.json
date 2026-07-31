@@ -1,0 +1,18 @@
+{
+  "agentbus": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "__AGENTBUS__ hook register",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "__AGENTBUS__ hook turn-end",
+        "timeout": 5
+      }
+    ]
+  }
+}

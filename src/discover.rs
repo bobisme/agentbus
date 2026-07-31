@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime};
 pub enum Source {
     Claude,
     Codex,
+    Agy,
 }
 
 pub struct Found {
@@ -32,12 +33,33 @@ fn recent(path: &std::path::Path, within: Duration) -> bool {
         .unwrap_or(false)
 }
 
-/// Every transcript touched within `within`, across both agents.
+/// Every transcript touched within `within`, across every agent.
 pub fn active(within: Duration) -> Vec<Found> {
     let mut out = Vec::new();
     claude(within, &mut out);
     codex(within, &mut out);
+    agy(within, &mut out);
     out
+}
+
+/// agy: ~/.gemini/antigravity-cli/brain/<conversationId>/.system_generated/logs/transcript.jsonl
+///
+/// `transcript_full.jsonl` sits beside it with the same records and untruncated
+/// content. Only one is followed — tailing both would double every event — and
+/// it is the shorter one, since what is clipped there is tool output rather
+/// than anything published.
+fn agy(within: Duration, out: &mut Vec<Found>) {
+    let root = home().join(".gemini/antigravity-cli/brain");
+    for conv in read_dirs(&root) {
+        let p = conv.join(".system_generated/logs/transcript.jsonl");
+        if p.is_file() && recent(&p, within) {
+            out.push(Found {
+                path: p,
+                source: Source::Agy,
+                parent_session: None,
+            });
+        }
+    }
 }
 
 /// Claude Code: ~/.claude/projects/<slug>/<session>.jsonl, with subagents in

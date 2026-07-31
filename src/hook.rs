@@ -40,7 +40,8 @@ pub fn run(args: &[String], register: &Path, inbox: &Path) {
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
 
     match event {
-        "register" => register_session(&payload, register),
+        "register" => register_session(&payload, register, inbox),
+        "turn-end" => turn_end(&payload, inbox),
         "subagent" => subagent(&payload, args.get(1).map(|s| s.as_str()), inbox),
         "state" => state(
             &payload,
@@ -54,6 +55,43 @@ pub fn run(args: &[String], register: &Path, inbox: &Path) {
 
 fn s(v: &Value, k: &str) -> String {
     v.get(k)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The first of several spellings a payload might use for the same thing.
+///
+/// Claude and Codex agree on snake_case; agy encodes its payloads with protojson
+/// and so spells everything camelCase — `conversationId`, `transcriptPath`. The
+/// alternative is a per-agent hook binary, which is what having one normalised
+/// bus is meant to avoid.
+fn first(v: &Value, keys: &[&str]) -> String {
+    for k in keys {
+        let got = s(v, k);
+        if !got.is_empty() {
+            return got;
+        }
+    }
+    String::new()
+}
+
+const SESSION_KEYS: &[&str] = &["session_id", "conversationId", "conversation_id"];
+const TRANSCRIPT_KEYS: &[&str] = &["transcript_path", "transcriptPath"];
+
+/// The working directory a payload reports, if it reports one.
+///
+/// agy sends `workspacePaths`, an array — an agy session can have several
+/// directories added to it. The first is the one it was started in, which is
+/// what corresponds to every other agent's single cwd.
+fn cwd_of(v: &Value) -> String {
+    let direct = first(v, &["cwd", "workingDirectory"]);
+    if !direct.is_empty() {
+        return direct;
+    }
+    v.get("workspacePaths")
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.first())
         .and_then(|x| x.as_str())
         .unwrap_or_default()
         .to_string()
@@ -170,7 +208,7 @@ fn agent_pid() -> u32 {
         if c.is_empty() {
             break;
         }
-        let names_agent = ["claude", "codex", "opencode"]
+        let names_agent = ["claude", "codex", "opencode", "agy"]
             .iter()
             .any(|n| c.contains(n));
         // Skip our own command line, which names an agent only because this
@@ -186,15 +224,32 @@ fn agent_pid() -> u32 {
     0
 }
 
-fn register_session(p: &Value, register: &Path) {
+fn register_session(p: &Value, register: &Path, inbox: &Path) {
     // A subagent shares its parent's pane and must not register as a session of
     // its own; it already appears nested under the parent.
     if !s(p, "agent_id").is_empty() {
         return;
     }
-    let session = s(p, "session_id");
+    let session = first(p, SESSION_KEYS);
     if session.is_empty() {
         return;
+    }
+    // Identity a transcript does not carry. agy's records name neither the
+    // working directory nor the model, and both are on every hook payload, so
+    // reporting them here is the difference between a named session and an
+    // anonymous one from its first prompt rather than its first finished turn.
+    let (cwd, model) = (cwd_of(p), first(p, &["modelName", "model"]));
+    if !cwd.is_empty() || !model.is_empty() {
+        append(
+            inbox,
+            &json!({
+                "kind": "session",
+                "session": session,
+                "cwd": cwd,
+                "model": model,
+            })
+            .to_string(),
+        );
     }
     // A record is written even with no pane to put in it. Most of what this
     // carries has nothing to do with a multiplexer: pid and start time are an
@@ -207,7 +262,7 @@ fn register_session(p: &Value, register: &Path) {
     let pid = agent_pid();
     let line = json!({
         "session_id": session,
-        "transcript": s(p, "transcript_path"),
+        "transcript": first(p, TRANSCRIPT_KEYS),
         "mux": mux,
         "mux_session": mux_session,
         "pane": pane,
@@ -215,6 +270,33 @@ fn register_session(p: &Value, register: &Path) {
         "starttime": starttime(pid),
     });
     append(register, &line.to_string());
+}
+
+/// The end of a turn, for a host that writes no record of one.
+///
+/// agy is the first: its transcript has no turn-end step, and the boundary is
+/// not derivable from what it does write — a `PLANNER_RESPONSE` bearing prose
+/// and no tool calls, which is agy's own `NO_TOOL_CALL` stop reason, occurs
+/// several times per turn as the model narrates between tool batches. Measured
+/// on a real conversation: 13 of them across 7 turns.
+///
+/// The answer is deliberately not carried here. It would have to survive
+/// `ATOMIC_LIMIT`, and an over-long line is dropped whole and without complaint,
+/// which would lose precisely the answers worth reading. The transcript path
+/// goes instead and the observer reads it — it is already tailing that file.
+fn turn_end(p: &Value, inbox: &Path) {
+    let session = first(p, SESSION_KEYS);
+    if session.is_empty() {
+        return;
+    }
+    let line = json!({
+        "kind": "turn_end",
+        "session": session,
+        "transcript": first(p, TRANSCRIPT_KEYS),
+        "cwd": cwd_of(p),
+        "model": first(p, &["modelName", "model"]),
+    });
+    append(inbox, &line.to_string());
 }
 
 fn subagent(p: &Value, phase: Option<&str>, inbox: &Path) {
