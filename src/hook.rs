@@ -16,7 +16,7 @@
 //! Every path exits 0. A monitoring hook must never be able to wedge an agent.
 
 use serde_json::{json, Value};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Appends of this size or less are atomic under O_APPEND on Linux, which is
@@ -26,8 +26,17 @@ const ATOMIC_LIMIT: usize = 4096;
 
 pub fn run(args: &[String], register: &Path, inbox: &Path) {
     let event = args.first().map(|s| s.as_str()).unwrap_or("");
+
+    // Only read stdin when it is a pipe. An agent delivering a hook payload
+    // always closes its end, so the read terminates — but a caller that simply
+    // spawns this command inherits its own stdin, and if that is the terminal
+    // the read never ends. Two things then go wrong at once: the caller waits
+    // forever on a command that cannot finish, and this process sits consuming
+    // the user's keystrokes from under the TUI they are typing into.
     let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
+    if !std::io::stdin().is_terminal() {
+        let _ = std::io::stdin().read_to_string(&mut raw);
+    }
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
 
     match event {
