@@ -13,6 +13,21 @@
 use crate::event::{one_line, Event, Kind};
 use serde_json::Value;
 
+/// The tool a record invokes, if it invokes one.
+///
+/// Codex spells this two ways and uses both heavily — `custom_tool_call` for
+/// its built-ins like `exec` and `apply_patch`, `function_call` for the rest
+/// including agent orchestration. Matching only one silently halves the count.
+/// The `*_output` records are the results coming back, and must not be counted
+/// again.
+fn tool_of(payload: &Value) -> Option<String> {
+    match payload.get("type").and_then(|x| x.as_str())? {
+        "custom_tool_call" | "function_call" | "local_shell_call" => {}
+        _ => return None,
+    }
+    s(payload, "name").or_else(|| s(payload, "tool_name"))
+}
+
 fn s(v: &Value, k: &str) -> Option<String> {
     v.get(k)
         .and_then(|x| x.as_str())
@@ -65,12 +80,9 @@ pub fn normalize_subagent(v: &Value, parent: &str, agent_id: &str, nickname: &st
             "task_complete" => {
                 result = s(payload, "last_agent_message").map(|t| one_line(&t, 160));
             }
-            "custom_tool_call" => {
-                tool = s(payload, "tool_name").or_else(|| s(payload, "name"));
-            }
-            // Anything else still dates the subagent, which is the only way its
-            // start time is known — its start hook carries no timestamp.
-            _ => {}
+            // Anything else still dates the subagent, which is the only way
+            // its start time is known — its start hook carries no timestamp.
+            _ => tool = tool_of(payload),
         }
     }
 
@@ -114,11 +126,24 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
                 .pointer("/payload/cwd")
                 .and_then(|x| x.as_str())
                 .map(|x| x.to_string()),
-            model: v
-                .pointer("/payload/model_provider")
-                .and_then(|x| x.as_str())
-                .map(|x| x.to_string()),
+            // Not model_provider, which is just "openai". session_meta does
+            // not name the model at all; turn_context does, below.
+            model: None,
         }));
+        return out;
+    }
+
+    // Emitted at the start of every turn, and the only record that names the
+    // model rather than its vendor.
+    if v.get("type").and_then(|x| x.as_str()) == Some("turn_context") {
+        if let Some(m) = v.pointer("/payload/model").and_then(|x| x.as_str()) {
+            out.push(mk(Kind::Session {
+                title: None,
+                title_rank: 0,
+                cwd: None,
+                model: Some(m.to_string()),
+            }));
+        }
         return out;
     }
 
@@ -169,12 +194,11 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
                 }));
             }
         }
-        "custom_tool_call" => {
-            if let Some(name) = s(payload, "tool_name").or_else(|| s(payload, "name")) {
+        _ => {
+            if let Some(name) = tool_of(payload) {
                 out.push(mk(Kind::Tool { name }));
             }
         }
-        _ => {}
     }
     out
 }
