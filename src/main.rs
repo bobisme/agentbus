@@ -585,33 +585,47 @@ fn name_subagents(
     tries: &mut BTreeMap<String, u32>,
 ) {
     for (session, st) in snap.sessions.iter_mut() {
-        // Codex names its subagents from its own rollout; this layout is
-        // Claude's, so looking there for anything else just burns syscalls.
-        if st.source != "claude" {
-            continue;
-        }
         let Some(pane) = regs.get(session) else {
             continue;
         };
-        if pane.transcript.is_empty() {
+        // Identified by where the transcript lives rather than by `source`:
+        // a session seen only through hooks has no agent of its own recorded,
+        // and those are exactly the ones still carrying unfiltered noise.
+        // Codex names its subagents from its own rollout, so looking for this
+        // layout anywhere else just burns syscalls.
+        if !pane.transcript.contains("/.claude/") {
             continue;
         }
+        let mut drop_ids: Vec<String> = Vec::new();
         for (id, sub) in st.subagents.iter_mut() {
             if !sub.agent_type.is_empty() && !sub.description.is_empty() {
                 continue;
             }
+            let path = claude::subagent_meta_path(&pane.transcript, id);
             let n = tries.entry(format!("{session}/{id}")).or_insert(0);
             if *n >= META_TRIES {
+                // Never acquired a sidecar, so it is not a Task subagent at
+                // all. Claude also fires the subagent hooks for its own
+                // internal agents — the ones that write suggested prompts and
+                // conversation recaps — whose "result" is UI text rather than
+                // work anyone asked for. They have no sidecar, ever, which is
+                // what tells them apart.
+                if sub.agent_type.is_empty() && !path.with_extension("meta.json").exists() {
+                    drop_ids.push(id.clone());
+                }
                 continue;
             }
             *n += 1;
-            let (t, d) = claude::subagent_meta(&claude::subagent_meta_path(&pane.transcript, id));
+            let (t, d) = claude::subagent_meta(&path);
             if !t.is_empty() {
                 sub.agent_type = t;
             }
             if !d.is_empty() {
                 sub.description = d;
             }
+        }
+        for id in drop_ids {
+            st.subagents.remove(&id);
         }
     }
 }

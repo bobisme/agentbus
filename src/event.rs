@@ -266,7 +266,13 @@ impl Snapshot {
             Some(now_secs())
         });
         let s = self.sessions.entry(e.session.clone()).or_default();
-        s.source = e.source.to_string();
+        // `source` names the agent, not whatever last spoke about it. A hook
+        // report is a transport; letting it overwrite made a Claude session
+        // read as "hook" the moment one arrived, and anything keyed on the
+        // agent then skipped it.
+        if e.source != "hook" || s.source.is_empty() {
+            s.source = e.source.to_string();
+        }
         if !e.ts.is_empty() {
             s.last_ts = e.ts.clone();
         }
