@@ -355,11 +355,11 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         // saying things that had stopped being so.
         if opts.publish {
             let txt = serde_json::to_string(&snap.to_json()).unwrap_or_default();
-            if txt != published || last_target.as_os_str().is_empty() {
-                if write_snapshot(&opts.snapshot, &txt, !opts.snapshot_pinned) {
-                    published = txt;
-                    last_target = opts.snapshot.clone();
-                }
+            if (txt != published || last_target.as_os_str().is_empty())
+                && write_snapshot(&opts.snapshot, &txt, !opts.snapshot_pinned)
+            {
+                published = txt;
+                last_target = opts.snapshot.clone();
             }
         }
         if !print_snapshot && !first {
@@ -470,9 +470,12 @@ fn append_log(path: &std::path::Path, batch: &[Event]) {
     else {
         return;
     };
+    let mut buf = String::new();
     for e in batch {
-        let _ = writeln!(f, "{}", e.to_json());
+        buf.push_str(&e.to_json().to_string());
+        buf.push('\n');
     }
+    let _ = f.write_all(buf.as_bytes());
 }
 
 /// Written via a temp file and renamed, so a subscriber polling the path never
