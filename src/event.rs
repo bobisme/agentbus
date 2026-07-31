@@ -466,7 +466,7 @@ impl Snapshot {
                 })
             })
             .collect();
-        json!({"version": 1, "sessions": sessions})
+        json!({"version": SNAPSHOT_VERSION, "sessions": sessions})
     }
 }
 
@@ -494,11 +494,27 @@ fn set_state(s: &mut SessionState, to: &str, at: Option<u64>) {
     }
 }
 
+/// Schema of the published snapshot.
+///
+/// 2 — `location: {mux, session, pane}`, replacing 1's `pane: {zellij_session,
+///     pane_id}`. The rename is what forced the bump: `mux` is the necessary
+///     field now that tmux, wezterm and kitty are recognised and a subscriber
+///     has to know which it is looking at.
+///
+/// Bump this whenever a field is renamed, removed, or changes meaning. Purely
+/// additive fields do not — `state_since`, `tools` and `effort` all arrived
+/// under 2 without one, and expressing that difference is what the number is
+/// for. A subscriber should accept the versions it knows and warn on anything
+/// else; the failure this exists to prevent is the silent one, where reading a
+/// renamed field yields nothing, no session ever matches, and the agent looks
+/// unresponsive rather than the schema looking wrong.
+pub const SNAPSHOT_VERSION: u64 = 2;
+
 /// Parse `2026-07-31T00:26:12.774Z` to epoch seconds, ignoring the fraction.
 ///
 /// Hand-rolled because this is the only date handling in the project and it is
 /// always this one shape; a dependency for it would cost more than it saves.
-fn iso_to_epoch(ts: &str) -> Option<u64> {
+pub fn iso_to_epoch(ts: &str) -> Option<u64> {
     let b = ts.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
         return None;

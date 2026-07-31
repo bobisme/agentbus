@@ -66,7 +66,7 @@ The snapshot is a single JSON document, rewritten atomically whenever the state
 it describes changes:
 
 ```json
-{ "version": 1, "sessions": [ {
+{ "version": 2, "sessions": [ {
   "session": "f431ece9-…", "source": "claude",
   "title": "…", "label": "the current task", "state": "working",
   "tokens": { "output": 1291114, "context": 163187 },
@@ -80,6 +80,17 @@ it describes changes:
 it — point it inside whatever directory that subscriber can read. A pinned path
 is written only once its directory exists, so it is safe to aim at a directory
 some other program creates later.
+
+`version` is the schema of this document. Accept the versions you know and warn
+on anything else — the failure it exists to prevent is silent, not loud. Version
+2 renamed `pane: {zellij_session, pane_id}` to `location: {mux, session, pane}`;
+a subscriber reading the old path against the new document matches no session,
+never binds, and reports a timeout while the agent sits there having already
+answered. Purely additive fields do not bump it, which is the distinction the
+number is there to express.
+
+Better still, do not read this file. `agentbus sessions` answers the same
+questions and keeps the schema an internal transport rather than a contract.
 
 `location.mux` is `zellij`, `tmux`, `wezterm` or `kitty`, detected from the
 environment the hook ran in. A subscriber should ignore locations it cannot
