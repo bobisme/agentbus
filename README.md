@@ -3,8 +3,8 @@
 Watch what the coding agents on your machine are doing, and publish it somewhere
 anything can subscribe to.
 
-It observes Claude Code, Codex and OpenCode, normalises them into one event
-vocabulary, and writes two things:
+It observes Claude Code, Codex, OpenCode and agy (Antigravity CLI, Gemini),
+normalises them into one event vocabulary, and writes two things:
 
 - **an event log** — append-only JSONL, tailable and replayable
 - **a state snapshot** — what is true right now, for subscribers that only want that
@@ -30,6 +30,7 @@ monitoring hook must never be able to wedge an agent.
 | Claude Code, Codex | SubagentStart / SubagentStop | `hook subagent start` / `stop` |
 | Claude Code, Codex | PermissionRequest | `hook state blocked permission` |
 | OpenCode | (plugin) | `integrations/opencode.js`, installed by `just sync-opencode` |
+| agy | PreInvocation, Stop | `integrations/agy-hooks.json`, installed by `just sync-agy [dir]` |
 
 Claude Code's `~/.claude/settings.json` and Codex's `~/.codex/hooks.json` share
 the same shape:
@@ -44,11 +45,12 @@ the same shape:
 
 Ranked by trust:
 
-1. **Transcripts** — `~/.claude/projects/**`, `~/.codex/sessions/**`. No agent
-   cooperation, no races, and far more detail than hooks: titles, prompts, tool
-   calls, tokens, turn boundaries. The primary source.
-2. **Hooks** — for the two things transcripts cannot carry: a subagent's
-   completion and result, and permission prompts.
+1. **Transcripts** — `~/.claude/projects/**`, `~/.codex/sessions/**`, and
+   `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`.
+   No agent cooperation, no races, and far more detail than hooks: titles,
+   prompts, tool calls, tokens, turn boundaries. The primary source.
+2. **Hooks** — for the things transcripts cannot carry: a subagent's completion
+   and result, permission prompts, and agy's turn boundary.
 
 Hooks are an *identity bridge*, not a data source. Transcripts say everything
 about a session except where it is: nothing on disk records which pane an agent
@@ -112,10 +114,90 @@ subscriber can wait on that pair without knowing which agent it is watching,
 which is the point of a normalised vocabulary — gate on the events, or on the
 snapshot's `state`, whichever suits.
 
-`turn_end` carries `result`, the agent's final message, from every source too.
-Claude's own end-of-turn record holds nothing but a duration, so the normaliser
-remembers the last assistant text of the turn and attaches it there; Codex
-carries it on the completion event. Neither asymmetry reaches a subscriber.
+`turn_end` carries the agent's final message from every source too. Claude's own
+end-of-turn record holds nothing but a duration, so the normaliser remembers the
+last assistant text of the turn and attaches it there; Codex carries it on the
+completion event. Neither asymmetry reaches a subscriber.
+
+It arrives in two spellings, because they have different jobs:
+
+- `result` — collapsed to one line and capped at 160 characters. A preview, for
+  a status bar. Lossy by design.
+- `result_full` — the message, untruncated, paragraphs intact.
+
+Read `result_full`. `result` exists for renderers, and a consumer that took it
+for the answer silently lost everything past the first sentence.
+
+## Asking
+
+Reading the snapshot file directly works, and every consumer that did it wrote
+the same four things: find the file, parse its schema, resolve an identity to a
+session, and keep up as both change. Two verbs replace all of it.
+
+```bash
+agentbus sessions [--pid N] [--session S] [--cwd D] [--json]
+agentbus wait (--session S | --pid N | --cwd D) [--timeout SECS] [--since EPOCH] [--json]
+```
+
+**`--pid` matches the process named or any descendant of it.** agentbus
+registers the *agent* process, which is not always the one a supervisor spawned
+— codex runs behind a node shim, so the supervisor holds the shim and the
+registration holds the real binary one level below. For claude the two coincide,
+which is what makes this an easy bug to ship: it works until it is pointed at
+codex.
+
+**`wait` blocks until the current-or-next turn ends** and prints the full answer
+on stdout, or `{status, session, result, duration_ms}` with `--json`. It exits
+`0` done, `3` blocked, `4` timeout, `1` if the session could not be resolved.
+`blocked` being distinct is the point of it: an agent sitting on a permission
+prompt looks exactly like a slow one to anything watching a screen, and burns
+the caller's whole timeout.
+
+It never reports a turn that ended before it started — internally a watermark on
+the event log, taken at entry. That is the one piece a caller cannot do for
+itself across two processes without persisting an offset to a file. The
+consequence is that a caller submitting first should mark the moment and say so:
+
+```bash
+t=$(date +%s)
+send_prompt_somehow
+agentbus wait --pid $AGENT_PID --since $t --json
+```
+
+Without `--since`, a turn that finishes between submitting and calling is behind
+the watermark, and the wait sits there until the *next* one.
+
+A session that has not registered yet is waited for rather than rejected — an
+agent does not appear until its first prompt, so the session a supervisor just
+gave work to routinely does not exist at the moment it asks.
+
+### agy is the odd one
+
+Its transcript is plain JSONL with a monotonic `step_index` and an ISO
+`created_at`, written for every conversation whether or not hooks are set up, so
+discovery needs no cooperation. The `.db` files under `conversations/` are the
+conversation store, are protobuf, and are deliberately never read.
+
+What it does not write is a turn boundary, and it is not derivable. The obvious
+rule — a `PLANNER_RESPONSE` bearing prose and no tool calls, which is agy's own
+`NO_TOOL_CALL` stop reason — gives 13 candidates across a 7-turn conversation,
+because the model narrates between tool batches. So the `Stop` hook carries it,
+the way Claude's `turn_duration` record does.
+
+**Without the hooks installed, agy sessions still appear** — with prompts, tool
+calls and labels — but never leave `working`, since nothing tells the bus a turn
+ended. `just sync-agy` installs them once, for every project.
+
+They go in `~/.gemini/config/hooks.json`. agy's own documentation says only
+"your customization root", which is misleading: `.agents/` is a customization
+root for skills and rules but is **not read for hooks at any level**, so a
+`hooks.json` placed there looks right and never fires. The real answer came from
+`strace` — agy probes four paths and opens that one.
+
+Two things it gets from the hook payload that its transcript never states: the
+working directory (`workspacePaths`) and the model (`modelName`). It spells its
+payload keys camelCase, being protojson, and reports `transcriptPath` without
+the `.jsonl` extension the file actually has.
 
 ## Liveness
 
@@ -132,7 +214,13 @@ this actually runs.
 just state       # what subscribers see
 just snapshot    # fold recent history once, without publishing
 just events      # follow normalised events
+agentbus sessions   # the same question, answered rather than dumped
 ```
+
+The reading verbs find the running observer's files themselves, via a small
+record it writes to its state dir on startup. Nothing needs to know that the
+service is pointed somewhere else — which it usually is, since a sandboxed
+subscriber gets `--snapshot` aimed at a directory it can read.
 
 ## Notes for anyone extending it
 
