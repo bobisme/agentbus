@@ -304,11 +304,29 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             }
         }
         // A `pane:` session is synthesised purely to give an agent with no
-        // transcript somewhere to hang its pane binding. Once that binding is
-        // gone the entry describes nothing, so it is dropped rather than left
-        // to accumulate one stale row per agent restart.
-        snap.sessions
-            .retain(|id, st| !id.starts_with("pane:") || !st.pane_id.is_empty());
+        // transcript somewhere to hang its pane binding. Two ways it stops
+        // being meaningful:
+        //
+        //  - its binding died, leaving an entry describing nothing;
+        //  - a real, transcript-backed session occupies the same pane, which
+        //    makes the synthesised one a duplicate that shadows it. Subscribers
+        //    index by pane, so a collision is resolved by whatever happens to
+        //    sort last — and "pane:" sorts after most session ids, so the
+        //    thinner entry silently won and the pane appeared stuck in whatever
+        //    state it was last reported in.
+        let claimed: std::collections::BTreeSet<String> = snap
+            .sessions
+            .iter()
+            .filter(|(id, st)| !id.starts_with("pane:") && !st.pane_id.is_empty())
+            .map(|(_, st)| format!("{}/{}", st.zellij_session, st.pane_id))
+            .collect();
+        snap.sessions.retain(|id, st| {
+            if !id.starts_with("pane:") {
+                return true;
+            }
+            !st.pane_id.is_empty()
+                && !claimed.contains(&format!("{}/{}", st.zellij_session, st.pane_id))
+        });
 
         // `first` is the backfill pass: real history, but not news.
         if opts.publish && !batch.is_empty() && !first {
