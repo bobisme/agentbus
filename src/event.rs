@@ -218,10 +218,22 @@ pub struct SessionState {
 #[derive(Default)]
 pub struct Snapshot {
     pub sessions: BTreeMap<String, SessionState>,
+    /// True while replaying history at startup. Transitions seen then happened
+    /// in the past, so they may only be timed from a record that says when —
+    /// never from the clock, which would date them all to startup.
+    pub backfilling: bool,
 }
 
 impl Snapshot {
     pub fn apply(&mut self, e: &Event) {
+        // When this happened. Transcript records carry a timestamp; hook reports
+        // do not, so live ones are dated now and replayed ones are left undated
+        // rather than guessed at.
+        let at = iso_to_epoch(&e.ts).or(if self.backfilling {
+            None
+        } else {
+            Some(now_secs())
+        });
         let s = self.sessions.entry(e.session.clone()).or_default();
         s.source = e.source.to_string();
         if !e.ts.is_empty() {
@@ -260,28 +272,28 @@ impl Snapshot {
                     // finished subagents stop being interesting.
                     s.subagents.retain(|_, sub| sub.done_since.is_none());
                 }
-                set_state(s, "working");
+                set_state(s, "working", at);
             }
             Kind::Label { text } => {
                 if !text.is_empty() {
                     s.label = text.clone();
                 }
             }
-            Kind::TurnEnd { .. } => set_state(s, "idle"),
+            Kind::TurnEnd { .. } => set_state(s, "idle", at),
             Kind::Reported { state, detail } => {
                 // Integrations still say "done" when a turn ends. That is the
                 // idle case — finished, awaiting whatever you ask next — so it
                 // is normalised here rather than leaking a fourth state onto
                 // the bus for every subscriber to special-case.
                 if !state.is_empty() {
-                    set_state(s, if state == "done" { "idle" } else { state });
+                    set_state(s, if state == "done" { "idle" } else { state }, at);
                 }
                 s.detail = detail.clone();
             }
             Kind::Tool { name } => {
                 s.last_tool = name.clone();
                 s.tool_calls += 1;
-                set_state(s, "working");
+                set_state(s, "working", at);
             }
             Kind::Tokens {
                 output,
@@ -392,11 +404,51 @@ impl Snapshot {
 
 /// Stamp when a state began, but only on an actual change. Re-stamping on every
 /// restatement would make a long-running turn permanently read as just started.
-fn set_state(s: &mut SessionState, to: &str) {
+///
+/// `at` of None means the moment is unknown — a replayed report with no
+/// timestamp of its own. The state still changes; only the clock stays silent,
+/// because a subscriber showing the wrong duration is worse than one showing
+/// none.
+fn set_state(s: &mut SessionState, to: &str, at: Option<u64>) {
     if s.state != to {
         s.state = to.to_string();
-        s.state_since = now_secs();
+        s.state_since = at.unwrap_or(0);
+        return;
     }
+    // Same state, but we never learned when it began — the transition was an
+    // undated report. The earliest dated record confirming it is not when it
+    // started, but it is a bound, and it beats showing nothing at all for a
+    // session that will not change state again for hours.
+    if s.state_since == 0 {
+        if let Some(t) = at {
+            s.state_since = t;
+        }
+    }
+}
+
+/// Parse `2026-07-31T00:26:12.774Z` to epoch seconds, ignoring the fraction.
+///
+/// Hand-rolled because this is the only date handling in the project and it is
+/// always this one shape; a dependency for it would cost more than it saves.
+fn iso_to_epoch(ts: &str) -> Option<u64> {
+    let b = ts.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let n = |a: usize, z: usize| ts.get(a..z)?.parse::<i64>().ok();
+    let (y, mo, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
+    let (h, mi, sec) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    // Days from civil, Howard Hinnant's algorithm: correct for any proleptic
+    // Gregorian date, and short enough to read.
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + h * 3600 + mi * 60 + sec;
+    u64::try_from(secs).ok()
 }
 
 fn now_secs() -> u64 {
@@ -419,5 +471,29 @@ pub fn one_line(s: &str, max: usize) -> String {
         collapsed.chars().take(max).collect::<String>() + "…"
     } else {
         collapsed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::iso_to_epoch;
+
+    /// Expected values from `date -d '<ts>' +%s`. This is the only date handling
+    /// in the project, and a wrong answer here shows a plausible but incorrect
+    /// duration rather than failing visibly.
+    #[test]
+    fn parses_transcript_timestamps() {
+        assert_eq!(iso_to_epoch("2026-07-31T00:26:12.774Z"), Some(1785457572));
+        assert_eq!(iso_to_epoch("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(iso_to_epoch("2000-03-01T00:00:00Z"), Some(951868800));
+        // Leap day, the case the month-shifting exists for.
+        assert_eq!(iso_to_epoch("2024-02-29T12:00:00Z"), Some(1709208000));
+    }
+
+    #[test]
+    fn rejects_anything_else() {
+        assert_eq!(iso_to_epoch(""), None);
+        assert_eq!(iso_to_epoch("not a date"), None);
+        assert_eq!(iso_to_epoch("2026-07-31"), None);
     }
 }

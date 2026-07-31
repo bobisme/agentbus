@@ -192,6 +192,9 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     let mut tails = tail::MultiTail::default();
     let mut streams: BTreeMap<PathBuf, Stream> = BTreeMap::new();
     let mut snap = Snapshot::default();
+    // The first pass replays history; transitions in it are dated from the
+    // records themselves, never from the clock.
+    snap.backfilling = true;
     // Pane bindings reported through the inbox by agents with no transcript.
     let mut inbox_panes: BTreeMap<String, register::Pane> = BTreeMap::new();
     // Registrations from the previous pass, so the sidecar lookup knows each
@@ -366,16 +369,8 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             }
             let _ = out.flush();
         }
-        // The backfill pass replays history, so every state change in it looks
-        // like it happened just now. Rather than publish "idle for 2s" for a
-        // session that has been idle for an hour, forget when these began and
-        // let the first real transition stamp it. No number beats a wrong one.
-        if first {
-            for st in snap.sessions.values_mut() {
-                st.state_since = 0;
-            }
-        }
         first = false;
+        snap.backfilling = false;
 
         if !follow {
             break;
