@@ -42,7 +42,12 @@ pub fn run(args: &[String], register: &Path, inbox: &Path) {
     match event {
         "register" => register_session(&payload, register),
         "subagent" => subagent(&payload, args.get(1).map(|s| s.as_str()), inbox),
-        "state" => state(&payload, args.get(1).map(|s| s.as_str()), args.get(2), inbox),
+        "state" => state(
+            &payload,
+            args.get(1).map(|s| s.as_str()),
+            args.get(2),
+            inbox,
+        ),
         _ => {}
     }
 }
@@ -62,8 +67,10 @@ fn env(k: &str) -> String {
 ///
 /// Every multiplexer exports its own pane identity, so the same walk works for
 /// all of them and a subscriber can ask for the one it renders. Empty pane means
-/// "not in one" — there is then nowhere to attribute the agent to, and the
-/// caller declines to report rather than inventing a location.
+/// "not in one" — a bare terminal, a CI job, a PTY runtime nobody here has heard
+/// of. That is reported as an empty location rather than guessed at: a
+/// subscriber already has to handle one, since a location is cleared the moment
+/// its binding goes stale.
 fn location() -> (&'static str, String, String) {
     let zellij = env("ZELLIJ_PANE_ID");
     if !zellij.is_empty() {
@@ -180,10 +187,6 @@ fn agent_pid() -> u32 {
 }
 
 fn register_session(p: &Value, register: &Path) {
-    let (mux, mux_session, pane) = location();
-    if pane.is_empty() {
-        return;
-    }
     // A subagent shares its parent's pane and must not register as a session of
     // its own; it already appears nested under the parent.
     if !s(p, "agent_id").is_empty() {
@@ -193,6 +196,14 @@ fn register_session(p: &Value, register: &Path) {
     if session.is_empty() {
         return;
     }
+    // A record is written even with no pane to put in it. Most of what this
+    // carries has nothing to do with a multiplexer: pid and start time are an
+    // exact process identity — the thing that lets a supervisor say "this
+    // session is the agent I spawned" instead of guessing from cwd and timing —
+    // and the transcript path is the only route to a session's subagent
+    // sidecars. Returning early on an unrecognised host threw all of that away
+    // to say nothing more than "I do not know where this is".
+    let (mux, mux_session, pane) = location();
     let pid = agent_pid();
     let line = json!({
         "session_id": session,
@@ -232,15 +243,16 @@ fn subagent(p: &Value, phase: Option<&str>, inbox: &Path) {
 fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path) {
     let Some(st) = st else { return };
     let (mux, mux_session, pane) = location();
-    if pane.is_empty() {
-        return;
-    }
     let pid = agent_pid();
     // Such an agent has no transcript and therefore no session id of its own.
     // Synthesising one from the pane keeps it a first-class row without
-    // pretending it was observed.
+    // pretending it was observed — but that needs a pane to name it after, so a
+    // report carrying neither is about nothing and is the one case dropped.
+    // A report that names its session stands on its own, pane or no pane:
+    // "blocked" reaches no transcript, so this is the only way it is ever heard.
     let session = match s(p, "session_id") {
         x if !x.is_empty() => x,
+        _ if pane.is_empty() => return,
         _ => format!("pane:{mux}/{mux_session}/{pane}"),
     };
     let line = json!({

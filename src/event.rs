@@ -25,17 +25,30 @@ pub enum Kind {
         cwd: Option<String>,
         model: Option<String>,
     },
-    /// The user asked for something. Doubles as the start-of-turn signal.
-    Prompt { text: String },
+    /// The user asked for something. Doubles as the start-of-turn signal, and
+    /// every source owes one: a subscriber waiting for `Prompt` then `TurnEnd`
+    /// must not need to know which agent it is watching. Emitting none left
+    /// such a wait hanging forever against Claude while working against Codex.
+    Prompt {
+        text: String,
+    },
     /// What the current task is, with no claim about the turn. Claude restates
     /// the last prompt *after* the turn-end record, so treating that restatement
     /// as a new turn left every session pinned to "working" forever.
-    Label { text: String },
+    Label {
+        text: String,
+    },
+    /// The turn is over. `result` is the agent's final message, and is carried
+    /// whatever the source: an agent whose end-of-turn record has no text has
+    /// it remembered from the turn instead, so that "what did it say" never
+    /// sends a subscriber off to find and parse a transcript itself.
     TurnEnd {
         duration_ms: Option<u64>,
         result: Option<String>,
     },
-    Tool { name: String },
+    Tool {
+        name: String,
+    },
     /// Two genuinely different quantities, which is why there is no single
     /// "total". `output` is work done and accumulates; `context` is how full the
     /// window is right now and does not. Summing `context` across messages
@@ -51,7 +64,10 @@ pub enum Kind {
     /// State asserted by an agent's own integration, for agents whose state
     /// reaches no file we can read. Unlike the derived states this may say
     /// "blocked", which no transcript ever records.
-    Reported { state: String, detail: String },
+    Reported {
+        state: String,
+        detail: String,
+    },
     Subagent {
         id: String,
         state: &'static str,
@@ -78,7 +94,9 @@ impl Event {
         });
         let o = v.as_object_mut().unwrap();
         match &self.kind {
-            Kind::Session { title, cwd, model, .. } => {
+            Kind::Session {
+                title, cwd, model, ..
+            } => {
                 o.insert("kind".into(), json!("session"));
                 if let Some(t) = title {
                     o.insert("title".into(), json!(t));
@@ -103,7 +121,10 @@ impl Event {
                 o.insert("kind".into(), json!("label"));
                 o.insert("text".into(), json!(text));
             }
-            Kind::TurnEnd { duration_ms, result } => {
+            Kind::TurnEnd {
+                duration_ms,
+                result,
+            } => {
                 o.insert("kind".into(), json!("turn_end"));
                 if let Some(d) = duration_ms {
                     o.insert("duration_ms".into(), json!(d));
@@ -170,6 +191,14 @@ pub struct SessionState {
     pub cwd: String,
     pub model: String,
     pub last_tool: String,
+    /// Tool calls in the current turn. Per turn rather than per session: the
+    /// question a roster answers is "what is it doing now", and a lifetime
+    /// total only grows.
+    pub tool_calls: u64,
+    /// When the current state began, epoch seconds. Published rather than an
+    /// elapsed count, because the snapshot is only rewritten when something
+    /// changes — an elapsed number would freeze between changes.
+    pub state_since: u64,
     /// Free text accompanying a reported state, e.g. what permission is being
     /// asked for.
     pub detail: String,
@@ -226,35 +255,33 @@ impl Snapshot {
                 // label the previous real prompt set.
                 if !text.is_empty() {
                     s.label = text.clone();
+                    s.tool_calls = 0;
                     // A real new prompt starts a new turn, so last turn's
                     // finished subagents stop being interesting.
                     s.subagents.retain(|_, sub| sub.done_since.is_none());
                 }
-                s.state = "working".into();
+                set_state(s, "working");
             }
             Kind::Label { text } => {
                 if !text.is_empty() {
                     s.label = text.clone();
                 }
             }
-            Kind::TurnEnd { .. } => s.state = "idle".into(),
+            Kind::TurnEnd { .. } => set_state(s, "idle"),
             Kind::Reported { state, detail } => {
                 // Integrations still say "done" when a turn ends. That is the
                 // idle case — finished, awaiting whatever you ask next — so it
                 // is normalised here rather than leaking a fourth state onto
                 // the bus for every subscriber to special-case.
                 if !state.is_empty() {
-                    s.state = if state == "done" {
-                        "idle".to_string()
-                    } else {
-                        state.clone()
-                    };
+                    set_state(s, if state == "done" { "idle" } else { state });
                 }
                 s.detail = detail.clone();
             }
             Kind::Tool { name } => {
                 s.last_tool = name.clone();
-                s.state = "working".into();
+                s.tool_calls += 1;
+                set_state(s, "working");
             }
             Kind::Tokens {
                 output,
@@ -349,6 +376,8 @@ impl Snapshot {
                     "cwd": s.cwd,
                     "model": s.model,
                     "last_tool": s.last_tool,
+                    "tools": s.tool_calls,
+                    "state_since": s.state_since,
                     "detail": s.detail,
                     "tokens": {"output": s.tokens_out, "context": s.context},
                     "last_activity": s.last_ts,
@@ -359,6 +388,22 @@ impl Snapshot {
             .collect();
         json!({"version": 1, "sessions": sessions})
     }
+}
+
+/// Stamp when a state began, but only on an actual change. Re-stamping on every
+/// restatement would make a long-running turn permanently read as just started.
+fn set_state(s: &mut SessionState, to: &str) {
+    if s.state != to {
+        s.state = to.to_string();
+        s.state_since = now_secs();
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Collapse to a single line and cap. Control characters are removed, not

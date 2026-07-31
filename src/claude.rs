@@ -5,6 +5,14 @@
 //! all here as explicit records: `custom-title`/`ai-title` for the name,
 //! `last-prompt` for the task, `system/turn_duration` for end-of-turn.
 //!
+//! Both turn boundaries are here too, but neither is labelled as one. The start
+//! is a `user` record — among hundreds of `user` records per turn that are not
+//! prompts at all, since tool results, slash-command stdout and interruptions
+//! are all written as user messages. The end is `system/turn_duration`, which
+//! carries a duration and nothing else, so the turn's answer has to be kept from
+//! the assistant message before it. Counted on one real transcript: 801 tool
+//! results against 76 actual prompts.
+//!
 //! What is *not* here is any permission-prompt record — approval is UI state and
 //! never reaches the transcript. Blocked detection therefore cannot move off the
 //! screen, which is why the plugin keeps its rule table.
@@ -23,8 +31,73 @@ fn session_of(v: &Value) -> Option<String> {
     s(v, "sessionId").or_else(|| s(v, "session_id"))
 }
 
+/// What one transcript's normaliser has to carry between lines.
+///
+/// Claude ends a turn with a record holding nothing but a duration, so the
+/// answer has to be remembered from the assistant message before it. Codex
+/// carries its final message on the completion event itself; keeping this is
+/// what stops `turn_end` meaning two different things depending on which agent
+/// produced it.
+#[derive(Default)]
+pub struct Turn {
+    /// Most recent non-empty assistant text since the last turn boundary.
+    answer: Option<String>,
+}
+
+/// The text of a `user` record that genuinely starts a turn, if it is one.
+///
+/// Most user records are not prompts, and there are hundreds of them per turn:
+/// every tool result is written as a user message, so are a slash command's
+/// caveat and its stdout, and an interrupted request leaves a marker of its own.
+/// Reading any of those as a turn start would pin the session to "working" and
+/// overwrite its label with machinery — the same mistake that made `last-prompt`
+/// a `Label` rather than a `Prompt`.
+fn user_prompt(v: &Value) -> Option<String> {
+    let flag = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    // Written by the harness rather than typed: local-command caveats, the
+    // placeholder standing in for a pasted image.
+    if flag("isMeta") {
+        return None;
+    }
+    // A subagent's own turn, which belongs to the subagent's row.
+    if flag("isSidechain") {
+        return None;
+    }
+    let text = match v.pointer("/message/content") {
+        Some(Value::String(t)) => t.clone(),
+        Some(Value::Array(blocks)) => {
+            let is = |b: &Value, t: &str| b.get("type").and_then(|x| x.as_str()) == Some(t);
+            // A tool result is a user message too, and is the overwhelming
+            // majority of them. Never a prompt, whatever else it carries.
+            if blocks.iter().any(|b| is(b, "tool_result")) {
+                return None;
+            }
+            blocks
+                .iter()
+                .filter(|b| is(b, "text"))
+                .filter_map(|b| b.get("text").and_then(|x| x.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        _ => return None,
+    };
+    let text = text.trim();
+    // Slash-command machinery arrives as user text — <command-name>,
+    // <local-command-stdout>. The Codex normaliser draws the same line around
+    // its replayed context blocks, for the same reason.
+    if text.is_empty() || text.starts_with('<') {
+        return None;
+    }
+    // What pressing escape writes. The real prompt follows it on the next line,
+    // so treating this one as the turn start would label the turn with it.
+    if text.starts_with("[Request interrupted by user") {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 /// One line of a top-level session transcript.
-pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
+pub fn normalize(v: &Value, fallback_session: &str, turn: &mut Turn) -> Vec<Event> {
     let session = session_of(v).unwrap_or_else(|| fallback_session.to_string());
     let ts = s(v, "timestamp").unwrap_or_default();
     let mk = |kind: Kind| Event {
@@ -77,11 +150,32 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
                 }));
             }
         }
+        // The turn start. Without one, a subscriber that follows events rather
+        // than polling the snapshot has no way to know a Claude turn began: a
+        // wait written as "see a prompt, then wait for turn_end" ran fine
+        // against Codex and hung forever here. `last-prompt` cannot serve, since
+        // it is written *after* the turn ends — this record is the one that
+        // actually opens it.
+        "user" => {
+            if let Some(t) = user_prompt(v) {
+                // Nothing the previous turn said is still pending. An
+                // interrupted turn never gets a turn_duration, and its
+                // half-answer must not surface as this turn's result.
+                turn.answer = None;
+                out.push(mk(Kind::Prompt {
+                    text: one_line(&t, 160),
+                }));
+            }
+        }
         "system" => {
             if v.get("subtype").and_then(|x| x.as_str()) == Some("turn_duration") {
                 out.push(mk(Kind::TurnEnd {
                     duration_ms: v.get("durationMs").and_then(|x| x.as_u64()),
-                    result: None,
+                    // This record carries no text, so the answer comes from the
+                    // assistant message that preceded it. Taken rather than
+                    // read, so a turn that says nothing reports nothing instead
+                    // of repeating the last turn's answer.
+                    result: turn.answer.take(),
                 }));
             }
         }
@@ -99,10 +193,22 @@ pub fn normalize(v: &Value, fallback_session: &str) -> Vec<Event> {
             }
             if let Some(blocks) = v.pointer("/message/content").and_then(|x| x.as_array()) {
                 for b in blocks {
-                    if b.get("type").and_then(|x| x.as_str()) == Some("tool_use") {
-                        if let Some(name) = s(b, "name") {
-                            out.push(mk(Kind::Tool { name }));
+                    match b.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+                        "tool_use" => {
+                            if let Some(name) = s(b, "name") {
+                                out.push(mk(Kind::Tool { name }));
+                            }
                         }
+                        // Held rather than published: while the turn is running
+                        // this is a running answer, and only the last one before
+                        // turn_duration is the answer. Clamped like every other
+                        // result, so the log line stays atomically appendable.
+                        "text" => {
+                            if let Some(t) = s(b, "text") {
+                                turn.answer = Some(one_line(&t, 160));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

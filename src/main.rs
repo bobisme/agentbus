@@ -184,6 +184,8 @@ struct Stream {
     description: String,
     /// Last published identity fingerprint, for suppressing restatements.
     last_identity: Option<String>,
+    /// What Claude's normaliser carries between lines of this transcript.
+    turn: claude::Turn,
 }
 
 fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
@@ -248,7 +250,10 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
                     // Identity is restated on every assistant line. Republishing
                     // unchanged cwd/model would make the log mostly noise, and a
                     // log worth tailing is the point of an append-only bus.
-                    if let event::Kind::Session { cwd, model, title, .. } = &e.kind {
+                    if let event::Kind::Session {
+                        cwd, model, title, ..
+                    } = &e.kind
+                    {
                         let fingerprint = format!(
                             "{}|{}|{}",
                             cwd.clone().unwrap_or_default(),
@@ -281,8 +286,22 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         // the live process. A closed pane drops its mapping the same tick.
         let mut regs = register::load(&opts.register);
         regs_prev = regs.clone();
+        // A registration knows things a report never does — the transcript
+        // path above all — but on an unrecognised host it carries no location.
+        // Where that is so, a report that does know one fills it in rather than
+        // being turned away by an entry that has nothing to say about panes.
         for (k, v) in &inbox_panes {
-            regs.entry(k.clone()).or_insert_with(|| v.clone());
+            match regs.get_mut(k) {
+                Some(existing) if existing.pane.is_empty() && !v.pane.is_empty() => {
+                    existing.mux = v.mux.clone();
+                    existing.mux_session = v.mux_session.clone();
+                    existing.pane = v.pane.clone();
+                }
+                Some(_) => {}
+                None => {
+                    regs.insert(k.clone(), v.clone());
+                }
+            }
         }
         for (session, st) in snap.sessions.iter_mut() {
             match regs.get(session) {
@@ -347,6 +366,15 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             }
             let _ = out.flush();
         }
+        // The backfill pass replays history, so every state change in it looks
+        // like it happened just now. Rather than publish "idle for 2s" for a
+        // session that has been idle for an hour, forget when these began and
+        // let the first real transition stamp it. No number beats a wrong one.
+        if first {
+            for st in snap.sessions.values_mut() {
+                st.state_since = 0;
+            }
+        }
         first = false;
 
         if !follow {
@@ -389,6 +417,7 @@ fn new_stream(f: &discover::Found) -> Stream {
         agent_type,
         description,
         last_identity: None,
+        turn: claude::Turn::default(),
     }
 }
 
@@ -406,15 +435,9 @@ fn events_for(st: &mut Stream, v: &serde_json::Value) -> Vec<Event> {
                         st.description = d;
                     }
                 }
-                claude::normalize_subagent(
-                    v,
-                    parent,
-                    &st.agent_id,
-                    &st.agent_type,
-                    &st.description,
-                )
+                claude::normalize_subagent(v, parent, &st.agent_id, &st.agent_type, &st.description)
             }
-            None => claude::normalize(v, &st.fallback),
+            None => claude::normalize(v, &st.fallback, &mut st.turn),
         },
         Source::Codex => {
             // A subagent's rollout must be recognised before anything else reads
@@ -434,9 +457,7 @@ fn events_for(st: &mut Stream, v: &serde_json::Value) -> Vec<Event> {
                 }
             }
             match &st.parent {
-                Some(parent) => {
-                    codex::normalize_subagent(v, parent, &st.agent_id, &st.description)
-                }
+                Some(parent) => codex::normalize_subagent(v, parent, &st.agent_id, &st.description),
                 None => codex::normalize(v, &st.fallback),
             }
         }
@@ -489,10 +510,7 @@ fn write_snapshot(path: &std::path::Path, txt: &str, create_dir: bool) -> bool {
 /// than observations — but they carry exactly what the transcripts cannot: a
 /// subagent's completion and result, and the state of an agent that writes no
 /// transcript we can read.
-fn inbox_events(
-    v: &serde_json::Value,
-    panes: &mut BTreeMap<String, register::Pane>,
-) -> Vec<Event> {
+fn inbox_events(v: &serde_json::Value, panes: &mut BTreeMap<String, register::Pane>) -> Vec<Event> {
     let g = |k: &str| {
         v.get(k)
             .and_then(|x| x.as_str())

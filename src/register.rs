@@ -54,7 +54,7 @@ pub fn load(path: &Path) -> BTreeMap<String, Pane> {
                 transcript: s("transcript"),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
                 starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),
-                },
+            },
         );
     }
     out

@@ -85,6 +85,27 @@ some other program creates later.
 environment the hook ran in. A subscriber should ignore locations it cannot
 render rather than assuming its own.
 
+All three location fields are **empty when the agent is not in a multiplexer we
+recognise** — a bare terminal, a CI job, a PTY runtime of someone's own. The
+session is still published: the registration also carries the agent's pid and
+start time, which is an exact process identity, so a supervisor can say "this
+session is the one I spawned" instead of inferring it from a matching `cwd` and
+plausible timing — which is ambiguous the moment two agents share a repo. An
+empty location is also what a subscriber already sees when a binding goes stale,
+so it needs no new handling.
+
+### Turn boundaries
+
+`prompt` opens a turn and `turn_end` closes it, **for every source**. A
+subscriber can wait on that pair without knowing which agent it is watching,
+which is the point of a normalised vocabulary — gate on the events, or on the
+snapshot's `state`, whichever suits.
+
+`turn_end` carries `result`, the agent's final message, from every source too.
+Claude's own end-of-turn record holds nothing but a duration, so the normaliser
+remembers the last assistant text of the turn and attaches it there; Codex
+carries it on the completion event. Neither asymmetry reaches a subscriber.
+
 ## Liveness
 
 A registration holds while the exact process that made it is alive — identified
