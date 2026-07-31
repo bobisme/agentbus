@@ -24,6 +24,15 @@ service: install
     systemctl --user enable --now agentbus.service
     systemctl --user status agentbus.service --no-pager | head -5
 
+# OpenCode loads plugins only from its own config dir, so the copy here is the
+# source and this is the only thing that keeps the two from drifting.
+
+# Install the OpenCode reporter.
+sync-opencode:
+    @mkdir -p ~/.config/opencode/plugin
+    cp integrations/opencode.js ~/.config/opencode/plugin/agentbus.js
+    @echo "synced into ~/.config/opencode/plugin/agentbus.js"
+
 # Run in the foreground.
 watch *ARGS:
     cargo run --release -- watch {{ ARGS }}

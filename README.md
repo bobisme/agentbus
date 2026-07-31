@@ -29,7 +29,7 @@ monitoring hook must never be able to wedge an agent.
 | Claude Code, Codex | SessionStart, UserPromptSubmit | `hook register` |
 | Claude Code, Codex | SubagentStart / SubagentStop | `hook subagent start` / `stop` |
 | Claude Code, Codex | PermissionRequest | `hook state blocked permission` |
-| OpenCode | (plugin) | `hook state <state> [detail]` |
+| OpenCode | (plugin) | `integrations/opencode.js`, installed by `just sync-opencode` |
 
 Claude Code's `~/.claude/settings.json` and Codex's `~/.codex/hooks.json` share
 the same shape:
