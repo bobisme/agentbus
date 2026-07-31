@@ -26,8 +26,10 @@ mod codex;
 mod discover;
 mod event;
 mod hook;
+mod query;
 mod register;
 mod tail;
+mod wait;
 
 use discover::Source;
 use event::{Event, Kind, Snapshot};
@@ -43,9 +45,26 @@ USAGE:
     agentbus watch              Follow live transcripts and publish
     agentbus scan               Fold recent history once, print the snapshot
     agentbus events             Follow and print events to stdout only
+    agentbus sessions           Query current state (see ASKING, below)
+    agentbus wait               Block until a turn ends, and say what it said
     agentbus hook register      Publish this session's pane (from a hook)
     agentbus hook subagent start|stop
     agentbus hook state <state> [detail]
+
+ASKING:
+    agentbus sessions [--pid N] [--session S] [--cwd D] [--json]
+    agentbus wait (--session S | --pid N) [--timeout SECS] [--since EPOCH] [--json]
+
+    --pid matches the named process or any descendant of it, so a supervisor
+    can pass the pid it spawned without knowing that codex runs behind a shim.
+
+    wait blocks until the current-or-next turn ends. It never reports a turn
+    that ended before it started, so a caller that submits first should mark
+    the moment — `t=$(date +%s)` — and pass --since $t, or a turn that lands
+    in the gap is missed.
+
+    wait exits 0 when the turn ended, 3 if the agent is blocked on a prompt,
+    4 on timeout, 1 if the session could not be resolved.
 
 OPTIONS:
     --within <MINS>   How recently a transcript must have changed (default 30)
@@ -69,6 +88,12 @@ fn main() {
         "watch" => run(&opts, true, true),
         "events" => run(&opts, true, false),
         "scan" => run(&opts, false, true),
+        // The reading verbs answer from what the observer published, so they
+        // resolve its locations rather than assuming the defaults: the service
+        // is routinely pointed elsewhere, and a reader guessing wrong reads a
+        // stale file and reports nothing wrong.
+        "sessions" => std::process::exit(query::run(&args[1..], &opts.resolved())),
+        "wait" => std::process::exit(wait::run(&args[1..], &opts.resolved())),
         "-h" | "--help" | "help" => print!("{USAGE}"),
         other => {
             eprintln!("agentbus: unknown command {other:?}\n");
@@ -148,6 +173,21 @@ impl Opts {
         }
         o
     }
+
+    /// What this invocation publishes, as a location record.
+    fn locations(&self) -> query::Locations {
+        query::Locations {
+            snapshot: self.snapshot.clone(),
+            log: self.log.clone(),
+            register: self.register.clone(),
+        }
+    }
+
+    /// Where to *read* from: what this invocation pinned, else wherever the
+    /// running observer says it publishes.
+    fn resolved(&self) -> query::Locations {
+        query::resolve(&state_dir(), &self.locations(), self.snapshot_pinned)
+    }
 }
 
 fn home() -> PathBuf {
@@ -189,12 +229,20 @@ struct Stream {
 }
 
 fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
+    // Say where this observer publishes, so readers need not hardcode it. Only
+    // when actually publishing: a --no-publish run maintains none of these
+    // files and must not point readers at them.
+    if opts.publish {
+        query::publish_locations(&state_dir(), &opts.locations());
+    }
     let mut tails = tail::MultiTail::default();
     let mut streams: BTreeMap<PathBuf, Stream> = BTreeMap::new();
-    let mut snap = Snapshot::default();
     // The first pass replays history; transitions in it are dated from the
     // records themselves, never from the clock.
-    snap.backfilling = true;
+    let mut snap = Snapshot {
+        backfilling: true,
+        ..Default::default()
+    };
     // Pane bindings reported through the inbox by agents with no transcript.
     let mut inbox_panes: BTreeMap<String, register::Pane> = BTreeMap::new();
     // Registrations from the previous pass, so the sidecar lookup knows each
