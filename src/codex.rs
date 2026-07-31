@@ -49,6 +49,7 @@ pub fn normalize_subagent(v: &Value, parent: &str, agent_id: &str, nickname: &st
     let ts = s(v, "timestamp").unwrap_or_default();
     let mut description = None;
     let mut result = None;
+    let mut tool = None;
 
     if v.get("type").and_then(|x| x.as_str()) != Some("session_meta") {
         let payload = v.get("payload").unwrap_or(&Value::Null);
@@ -64,10 +65,12 @@ pub fn normalize_subagent(v: &Value, parent: &str, agent_id: &str, nickname: &st
             "task_complete" => {
                 result = s(payload, "last_agent_message").map(|t| one_line(&t, 160));
             }
-            _ => return Vec::new(),
-        }
-        if description.is_none() && result.is_none() {
-            return Vec::new();
+            "custom_tool_call" => {
+                tool = s(payload, "tool_name").or_else(|| s(payload, "name"));
+            }
+            // Anything else still dates the subagent, which is the only way its
+            // start time is known — its start hook carries no timestamp.
+            _ => {}
         }
     }
 
@@ -81,6 +84,7 @@ pub fn normalize_subagent(v: &Value, parent: &str, agent_id: &str, nickname: &st
             agent_type: Some(nickname.to_string()),
             description,
             result,
+            tool,
         },
     }]
 }

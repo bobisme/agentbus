@@ -275,22 +275,8 @@ pub fn normalize_subagent(
     description: &str,
 ) -> Vec<Event> {
     let ts = s(v, "timestamp").unwrap_or_default();
-    let mut result = None;
-    // The last assistant text is the running answer; when the file stops growing
-    // it is the final one. There is no end-of-subagent record to wait for.
-    if v.get("type").and_then(|x| x.as_str()) == Some("assistant") {
-        if let Some(blocks) = v.pointer("/message/content").and_then(|x| x.as_array()) {
-            for b in blocks {
-                if b.get("type").and_then(|x| x.as_str()) == Some("text") {
-                    if let Some(t) = s(b, "text") {
-                        result = Some(one_line(&t, 160));
-                    }
-                }
-            }
-        }
-    }
-    vec![Event {
-        ts,
+    let mk = |result: Option<String>, tool: Option<String>| Event {
+        ts: ts.clone(),
         source: "claude",
         session: parent_session.to_string(),
         kind: Kind::Subagent {
@@ -299,6 +285,36 @@ pub fn normalize_subagent(
             agent_type: Some(agent_type.to_string()),
             description: Some(description.to_string()),
             result,
+            tool,
         },
-    }]
+    };
+    let mut out = Vec::new();
+    if v.get("type").and_then(|x| x.as_str()) == Some("assistant") {
+        if let Some(blocks) = v.pointer("/message/content").and_then(|x| x.as_array()) {
+            for b in blocks {
+                match b.get("type").and_then(|x| x.as_str()) {
+                    // The last assistant text is the running answer; when the
+                    // file stops growing it is the final one. There is no
+                    // end-of-subagent record to wait for.
+                    Some("text") => {
+                        if let Some(t) = s(b, "text") {
+                            out.push(mk(Some(one_line(&t, 160)), None));
+                        }
+                    }
+                    Some("tool_use") => {
+                        if let Some(name) = s(b, "name") {
+                            out.push(mk(None, Some(name)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Even a record that says nothing new dates the subagent, which is the only
+    // way its start time is known.
+    if out.is_empty() {
+        out.push(mk(None, None));
+    }
+    out
 }

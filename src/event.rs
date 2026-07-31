@@ -74,6 +74,10 @@ pub enum Kind {
         agent_type: Option<String>,
         description: Option<String>,
         result: Option<String>,
+        /// A tool the subagent just invoked, counted the same way a session's
+        /// are. Subagents write their own transcripts, so this is observed
+        /// rather than reported.
+        tool: Option<String>,
     },
 }
 
@@ -150,8 +154,12 @@ impl Event {
                 agent_type,
                 description,
                 result,
+                tool,
             } => {
                 o.insert("kind".into(), json!("subagent"));
+                if let Some(t) = tool {
+                    o.insert("tool".into(), json!(t));
+                }
                 o.insert("id".into(), json!(id));
                 o.insert("state".into(), json!(state));
                 if let Some(t) = agent_type {
@@ -175,6 +183,11 @@ pub struct SubState {
     pub description: String,
     pub result: String,
     pub state: String,
+    pub tools: u64,
+    pub last_tool: String,
+    /// Epoch seconds of the earliest record seen for this subagent. Its start
+    /// hook carries no timestamp, so this comes from its transcript.
+    pub started: u64,
     /// When it finished, for expiry. Set once, on the transition.
     pub done_since: Option<SystemTime>,
 }
@@ -317,8 +330,21 @@ impl Snapshot {
                 agent_type,
                 description,
                 result,
+                tool,
             } => {
                 let sub = s.subagents.entry(id.clone()).or_default();
+                if let Some(t) = tool {
+                    sub.tools += 1;
+                    sub.last_tool = t.clone();
+                }
+                // Earliest record wins: a subagent's own transcript is the only
+                // thing that says when it started, since the hook that
+                // announces it carries no timestamp.
+                if let Some(t) = at {
+                    if sub.started == 0 || t < sub.started {
+                        sub.started = t;
+                    }
+                }
                 // Stamp the transition, not every repeat, or the clock resets
                 // each time the same completion is seen and it never expires.
                 if *state == "done" && sub.done_since.is_none() {
@@ -376,6 +402,9 @@ impl Snapshot {
                             "agent_type": sub.agent_type,
                             "description": sub.description,
                             "result": sub.result,
+                            "tools": sub.tools,
+                            "last_tool": sub.last_tool,
+                            "started": sub.started,
                         })
                     })
                     .collect();
