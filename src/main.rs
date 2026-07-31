@@ -303,6 +303,12 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
                 }
             }
         }
+        // A `pane:` session is synthesised purely to give an agent with no
+        // transcript somewhere to hang its pane binding. Once that binding is
+        // gone the entry describes nothing, so it is dropped rather than left
+        // to accumulate one stale row per agent restart.
+        snap.sessions
+            .retain(|id, st| !id.starts_with("pane:") || !st.pane_id.is_empty());
 
         // `first` is the backfill pass: real history, but not news.
         if opts.publish && !batch.is_empty() && !first {
