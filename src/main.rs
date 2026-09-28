@@ -316,7 +316,7 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) -> i32 {
             &found.path,
             tail::TailCheckpoint {
                 offset,
-                partial: String::new(),
+                partial: Vec::new(),
             },
         ) {
             saved_cursors.insert(found.path, saved);

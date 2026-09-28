@@ -9,13 +9,18 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+/// Size of one read from a followed file.
+const READ_BUFFER: usize = 1 << 16;
+
 #[derive(Default)]
 struct Cursor {
     offset: u64,
     /// Bytes read that don't yet end in a newline. Agents append whole JSON
     /// objects, but a poll can still land mid-write, and half a line parses as
-    /// nothing at best and as the wrong thing at worst.
-    partial: String,
+    /// nothing at best and as the wrong thing at worst. Kept as bytes: a
+    /// multibyte character can be cut by a poll or by the read buffer, and
+    /// decoding is only sound on a whole line.
+    partial: Vec<u8>,
 }
 
 /// Durable portion of one tail cursor. The file identity is stored by the
@@ -23,7 +28,7 @@ struct Cursor {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TailCheckpoint {
     pub offset: u64,
-    pub partial: String,
+    pub partial: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -48,7 +53,7 @@ impl MultiTail {
             path.to_path_buf(),
             Cursor {
                 offset,
-                partial: String::new(),
+                partial: Vec::new(),
             },
         );
     }
@@ -89,7 +94,7 @@ impl MultiTail {
             path.to_path_buf(),
             Cursor {
                 offset,
-                partial: String::new(),
+                partial: Vec::new(),
             },
         );
     }
@@ -107,6 +112,10 @@ impl MultiTail {
 
     /// Read everything appended since the last poll, as complete lines.
     pub fn poll(&mut self, path: &Path) -> Vec<String> {
+        self.poll_with_buffer(path, READ_BUFFER)
+    }
+
+    fn poll_with_buffer(&mut self, path: &Path, buffer: usize) -> Vec<String> {
         let Some(cur) = self.cursors.get_mut(path) else {
             return Vec::new();
         };
@@ -132,16 +141,20 @@ impl MultiTail {
             return Vec::new();
         }
         let mut out = Vec::new();
-        let mut buf = vec![0u8; 1 << 16];
+        let mut buf = vec![0u8; buffer.max(1)];
         while cur.offset < len {
             let n = match f.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
             cur.offset += n as u64;
-            cur.partial.push_str(&String::from_utf8_lossy(&buf[..n]));
-            while let Some(idx) = cur.partial.find('\n') {
-                let line: String = cur.partial.drain(..=idx).collect();
+            cur.partial.extend_from_slice(&buf[..n]);
+            // Split on the raw newline byte and decode each line once, whole.
+            // 0x0A never occurs inside a multibyte UTF-8 sequence, so a split
+            // here cannot cut a character.
+            while let Some(idx) = cur.partial.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = cur.partial.drain(..=idx).collect();
+                let line = String::from_utf8_lossy(&raw);
                 let line = line.trim_end_matches(['\n', '\r']);
                 if !line.is_empty() {
                     out.push(line.to_string());
@@ -217,5 +230,200 @@ mod tests {
             .unwrap();
         writeln!(file, "lo").unwrap();
         assert_eq!(resumed.poll(&path), vec!["hello"]);
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_polls_is_decoded_once() {
+        // bn-1q3: "é" is 0xC3 0xA9. Decoding each chunk on its own turned the
+        // two halves into two U+FFFD.
+        let path = temp_file("utf8-split");
+        std::fs::write(&path, b"x\xC3").unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, true);
+        assert!(tails.poll(&path).is_empty());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"\xA9\n").unwrap();
+        assert_eq!(tails.poll(&path), vec!["x\u{e9}"]);
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_the_read_buffer_is_decoded_once() {
+        let path = temp_file("utf8-buffer");
+        // 'a' then "é" repeated: é starts at every odd offset, so the read
+        // boundary at byte 65536 falls between the two bytes of one.
+        let mut content = format!("a{}", "\u{e9}".repeat(36_000)).into_bytes();
+        assert_eq!(content[65_535], 0xC3);
+        content.push(b'\n');
+        std::fs::write(&path, &content).unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, true);
+        assert_eq!(
+            tails.poll(&path),
+            vec![format!("a{}", "\u{e9}".repeat(36_000))]
+        );
+    }
+
+    mod property {
+        use super::*;
+        use crate::cursor;
+        use proptest::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Pieces chosen to hit every case the tailer distinguishes: one to
+        /// four byte characters, bytes that are never valid UTF-8, lone and
+        /// paired carriage returns, and blank lines.
+        fn piece() -> impl Strategy<Value = Vec<u8>> {
+            prop_oneof![
+                3 => "[a-z {}\":]{0,6}".prop_map(String::into_bytes),
+                2 => Just("\u{e9}".as_bytes().to_vec()),
+                2 => Just("\u{20ac}".as_bytes().to_vec()),
+                2 => Just("\u{1f600}".as_bytes().to_vec()),
+                1 => Just(vec![0xff]),
+                1 => Just(vec![0xc3]),
+                1 => Just(vec![0x80]),
+                1 => Just(vec![0xf0, 0x9f]),
+                1 => Just(b"\r".to_vec()),
+                2 => Just(b"\n".to_vec()),
+                1 => Just(b"\r\n".to_vec()),
+            ]
+        }
+
+        #[derive(Clone, Debug)]
+        enum Checkpoint {
+            None,
+            Direct,
+            ThroughDisk,
+        }
+
+        /// (append this many bytes next, poll afterwards?, checkpoint kind)
+        type Step = (usize, bool, Checkpoint);
+
+        fn step() -> impl Strategy<Value = Step> {
+            (
+                any::<usize>(),
+                any::<bool>(),
+                prop_oneof![
+                    2 => Just(Checkpoint::None),
+                    1 => Just(Checkpoint::Direct),
+                    1 => Just(Checkpoint::ThroughDisk),
+                ],
+            )
+        }
+
+        /// Which read size to poll with, and whether to put more than 64 KiB
+        /// in front so the real buffer boundary is crossed as well.
+        fn scenario() -> impl Strategy<Value = (usize, bool)> {
+            prop_oneof![
+                4 => (1usize..=9, Just(false)),
+                1 => (Just(READ_BUFFER), Just(true)),
+                1 => (Just(4096usize), Just(true)),
+            ]
+        }
+
+        fn oracle(content: &[u8]) -> Vec<String> {
+            let end = content
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            content[..end]
+                .split_inclusive(|&b| b == b'\n')
+                .map(|raw| {
+                    String::from_utf8_lossy(raw)
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string()
+                })
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        fn case_dir() -> PathBuf {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("agentbus-tail-prop-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn through_disk(dir: &Path, path: &Path, tail: TailCheckpoint) -> TailCheckpoint {
+            let mut saved = BTreeMap::new();
+            saved.insert(
+                path.to_path_buf(),
+                cursor::SavedCursor::capture(path, tail).unwrap(),
+            );
+            let file = dir.join("cursors.json");
+            std::fs::write(&file, cursor::encode(&saved)).unwrap();
+            cursor::load(&file).remove(path).unwrap().tail
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(96))]
+
+            #[test]
+            fn every_complete_line_is_emitted_once_whatever_the_chunking(
+                pieces in proptest::collection::vec(piece(), 0..40),
+                (buffer, big) in scenario(),
+                steps in proptest::collection::vec(step(), 1..12),
+                whole_prefix_first in any::<bool>(),
+            ) {
+                let mut content = if big {
+                    // é starts at odd offsets: the 64 KiB read boundary
+                    // (and 4096) cuts one in half.
+                    format!("a{}", "\u{e9}".repeat(36_000)).into_bytes()
+                } else {
+                    Vec::new()
+                };
+                content.extend(pieces.concat());
+
+                // Turn the arbitrary numbers into ascending cut points, so the
+                // file grows in arbitrary byte-sized chunks.
+                // With `whole_prefix_first` nothing is polled until the long
+                // prefix is all on disk, so one poll starts at offset 0 and
+                // crosses the read boundary at a known place instead of one
+                // that earlier random polls have shifted.
+                let floor = if big && whole_prefix_first { 72_001 } else { 0 };
+                let mut cuts: Vec<usize> = steps
+                    .iter()
+                    .map(|(at, _, _)| (at % (content.len() + 1)).max(floor))
+                    .collect();
+                cuts.sort_unstable();
+
+                let dir = case_dir();
+                let path = dir.join("t.jsonl");
+                std::fs::write(&path, b"").unwrap();
+                let mut tails = MultiTail::default();
+                tails.track(&path, true);
+                let mut emitted = Vec::new();
+                let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+                let mut written = 0;
+                for (cut, (_, poll, checkpoint)) in cuts.iter().zip(&steps) {
+                    file.write_all(&content[written..*cut]).unwrap();
+                    written = *cut;
+                    if *poll {
+                        emitted.extend(tails.poll_with_buffer(&path, buffer));
+                    }
+                    let tail = match checkpoint {
+                        Checkpoint::None => continue,
+                        _ => tails.checkpoints().pop().map(|(_, cp)| cp),
+                    };
+                    let Some(tail) = tail else { continue };
+                    let tail = match checkpoint {
+                        Checkpoint::ThroughDisk => through_disk(&dir, &path, tail),
+                        _ => tail,
+                    };
+                    tails = MultiTail::default();
+                    tails.restore(&path, tail);
+                }
+                file.write_all(&content[written..]).unwrap();
+                emitted.extend(tails.poll_with_buffer(&path, buffer));
+
+                let _ = std::fs::remove_dir_all(&dir);
+                prop_assert_eq!(emitted, oracle(&content));
+            }
+        }
     }
 }

@@ -12,7 +12,33 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-const VERSION: u64 = 1;
+/// Version 2 stores the partial line as lowercase hex in `partial_hex`, because
+/// a partial line is raw bytes and may end inside a multibyte character, which
+/// a JSON string cannot hold. Version 1 stored it lossily as a string in
+/// `partial`; those files still load, their string becoming its UTF-8 bytes.
+const VERSION: u64 = 2;
+const OLDEST_READABLE: u64 = 1;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 15) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    let raw = text.as_bytes();
+    if !raw.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    raw.chunks(2)
+        .map(|pair| Some(nibble(pair[0])? << 4 | nibble(pair[1])?))
+        .collect()
+}
 pub const MAX_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Debug)]
@@ -56,9 +82,10 @@ pub fn load(path: &Path) -> BTreeMap<PathBuf, SavedCursor> {
     let Ok(root) = serde_json::from_str::<Value>(&text) else {
         return BTreeMap::new();
     };
-    if root.get("version").and_then(Value::as_u64) != Some(VERSION) {
-        return BTreeMap::new();
-    }
+    let version = match root.get("version").and_then(Value::as_u64) {
+        Some(v) if (OLDEST_READABLE..=VERSION).contains(&v) => v,
+        _ => return BTreeMap::new(),
+    };
     let Some(entries) = root.get("streams").and_then(Value::as_array) else {
         return BTreeMap::new();
     };
@@ -74,11 +101,22 @@ pub fn load(path: &Path) -> BTreeMap<PathBuf, SavedCursor> {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
             let offset = entry.get("offset")?.as_u64()?;
-            let partial = entry
-                .get("partial")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            // An undecodable partial drops the entry: resuming with the wrong
+            // bytes would emit a corrupt line, while a dropped cursor is
+            // re-seeded at the file's end by the caller.
+            let partial = if version == 1 {
+                entry
+                    .get("partial")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .as_bytes()
+                    .to_vec()
+            } else {
+                match entry.get("partial_hex").and_then(Value::as_str) {
+                    Some(hex) => hex_decode(hex)?,
+                    None => Vec::new(),
+                }
+            };
             Some((
                 path,
                 SavedCursor {
@@ -119,7 +157,7 @@ pub fn encode(cursors: &BTreeMap<PathBuf, SavedCursor>) -> String {
                 "ino": saved.ino,
                 "modified_ns": saved.modified_ns.to_string(),
                 "offset": saved.tail.offset,
-                "partial": saved.tail.partial,
+                "partial_hex": hex_encode(&saved.tail.partial),
             })
         })
         .collect();
@@ -164,7 +202,7 @@ mod tests {
                 modified_ns: u64::MAX as u128 + 99,
                 tail: TailCheckpoint {
                     offset: 44,
-                    partial: "half".into(),
+                    partial: b"half".to_vec(),
                 },
             },
         );
@@ -175,7 +213,7 @@ mod tests {
         std::fs::write(&saved, serde_json::to_string(&root).unwrap()).unwrap();
         let got = load(&saved);
         assert_eq!(got[&path].modified_ns, u64::MAX as u128 + 99);
-        assert_eq!(got[&path].tail.partial, "half");
+        assert_eq!(got[&path].tail.partial, b"half");
     }
 
     #[test]
@@ -189,11 +227,53 @@ mod tests {
             &path,
             TailCheckpoint {
                 offset: 13,
-                partial: String::new(),
+                partial: Vec::new(),
             },
         )
         .unwrap();
         std::fs::write(&path, "new\n").unwrap();
         assert!(!saved.matches(&path));
+    }
+
+    #[test]
+    fn a_version_1_file_still_loads() {
+        let dir = std::env::temp_dir().join(format!("agentbus-cursor-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("cursors.json");
+        std::fs::write(
+            &saved,
+            r#"{"version":1,"streams":[{"path":"/tmp/t.jsonl","dev":2,"ino":3,
+                "modified_ns":"77","offset":44,"partial":"h\u00e9"}]}"#,
+        )
+        .unwrap();
+        let got = load(&saved);
+        let cursor = &got[&PathBuf::from("/tmp/t.jsonl")];
+        assert_eq!(cursor.tail.offset, 44);
+        assert_eq!(cursor.tail.partial, "h\u{e9}".as_bytes());
+        assert_eq!(cursor.modified_ns, 77);
+    }
+
+    #[test]
+    fn a_partial_ending_inside_a_character_round_trips() {
+        let path = PathBuf::from("/tmp/transcript.jsonl");
+        let mut input = BTreeMap::new();
+        let partial = vec![b'x', 0xc3, 0xff, 0x00];
+        input.insert(
+            path.clone(),
+            SavedCursor {
+                dev: 1,
+                ino: 1,
+                modified_ns: 0,
+                tail: TailCheckpoint {
+                    offset: 4,
+                    partial: partial.clone(),
+                },
+            },
+        );
+        let dir = std::env::temp_dir().join(format!("agentbus-cursor-hex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = dir.join("cursors.json");
+        std::fs::write(&saved, encode(&input)).unwrap();
+        assert_eq!(load(&saved)[&path].tail.partial, partial);
     }
 }
