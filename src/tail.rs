@@ -266,6 +266,178 @@ mod tests {
         );
     }
 
+    fn append(path: &Path, bytes: &[u8]) {
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[test]
+    fn truncation_skips_to_the_new_end_and_later_appends_are_not_a_replay() {
+        let path = temp_file("truncate");
+        std::fs::write(&path, "one\ntwo\nthr").unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, true);
+        assert_eq!(tails.poll(&path), vec!["one", "two"]);
+        // A partial "thr" is held.
+        assert_eq!(tails.checkpoints()[0].1.partial, b"thr");
+
+        std::fs::write(&path, "x\n").unwrap();
+        assert!(tails.poll(&path).is_empty());
+        let cp = tails.checkpoints().pop().unwrap().1;
+        assert_eq!(cp.offset, 2);
+        assert!(cp.partial.is_empty());
+
+        // The truncated content "x" is not replayed; the append is emitted
+        // alone, without the stale "thr" glued on.
+        append(&path, b"new\n");
+        assert_eq!(tails.poll(&path), vec!["new"]);
+    }
+
+    #[test]
+    fn truncation_to_empty_resets_the_cursor_to_zero() {
+        let path = temp_file("truncate-empty");
+        std::fs::write(&path, "abc\n").unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, true);
+        assert_eq!(tails.poll(&path), vec!["abc"]);
+        std::fs::write(&path, "").unwrap();
+        assert!(tails.poll(&path).is_empty());
+        assert_eq!(tails.checkpoints()[0].1.offset, 0);
+        append(&path, b"d\n");
+        assert_eq!(tails.poll(&path), vec!["d"]);
+    }
+
+    #[test]
+    fn an_unchanged_file_yields_nothing_and_keeps_its_cursor() {
+        let path = temp_file("unchanged");
+        std::fs::write(&path, "abc\n").unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, true);
+        assert_eq!(tails.poll(&path), vec!["abc"]);
+        assert!(tails.poll(&path).is_empty());
+        assert_eq!(tails.checkpoints()[0].1.offset, 4);
+    }
+
+    #[test]
+    fn polling_an_untracked_or_missing_file_yields_nothing() {
+        let path = temp_file("untracked");
+        std::fs::write(&path, "abc\n").unwrap();
+        let mut tails = MultiTail::default();
+        assert!(tails.poll(&path).is_empty());
+        tails.track(&path, true);
+        std::fs::remove_file(&path).unwrap();
+        assert!(tails.poll(&path).is_empty());
+    }
+
+    #[test]
+    fn reset_to_end_skips_existing_content_and_drops_the_partial() {
+        let path = temp_file("reset");
+        std::fs::write(&path, "one\ntw").unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, true);
+        assert_eq!(tails.poll(&path), vec!["one"]);
+        assert_eq!(tails.checkpoints()[0].1.partial, b"tw");
+
+        append(&path, b"o\nthree\n");
+        tails.reset_to_end(&path);
+        let cp = tails.checkpoints().pop().unwrap().1;
+        assert_eq!(cp.offset, std::fs::metadata(&path).unwrap().len());
+        assert!(cp.partial.is_empty());
+        assert!(tails.poll(&path).is_empty());
+
+        append(&path, b"four\n");
+        assert_eq!(tails.poll(&path), vec!["four"]);
+    }
+
+    #[test]
+    fn reset_to_end_starts_tracking_an_untracked_path() {
+        let path = temp_file("reset-untracked");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut tails = MultiTail::default();
+        assert!(!tails.is_tracked(&path));
+        tails.reset_to_end(&path);
+        assert!(tails.is_tracked(&path));
+        assert_eq!(tails.checkpoints()[0].1.offset, 4);
+    }
+
+    #[test]
+    fn is_tracked_follows_track_and_drop_missing() {
+        let path = temp_file("tracked");
+        let other = path.with_file_name("other.jsonl");
+        std::fs::write(&path, "a\n").unwrap();
+        let mut tails = MultiTail::default();
+        assert!(!tails.is_tracked(&path));
+        tails.track(&path, false);
+        assert!(tails.is_tracked(&path));
+        assert!(!tails.is_tracked(&other));
+        std::fs::remove_file(&path).unwrap();
+        tails.drop_missing();
+        assert!(!tails.is_tracked(&path));
+    }
+
+    #[test]
+    fn track_without_from_start_begins_at_the_current_end() {
+        let path = temp_file("track-end");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, false);
+        assert_eq!(tails.checkpoints()[0].1.offset, 4);
+        assert!(tails.poll(&path).is_empty());
+        append(&path, b"new\n");
+        assert_eq!(tails.poll(&path), vec!["new"]);
+    }
+
+    #[test]
+    fn checkpoints_report_each_path_offset_and_partial_bytes() {
+        let a = temp_file("cp-a");
+        let b = temp_file("cp-b");
+        std::fs::write(&a, b"one\nha\xC3").unwrap();
+        std::fs::write(&b, "whole\n").unwrap();
+        let mut tails = MultiTail::default();
+        assert!(tails.checkpoints().is_empty());
+        tails.track(&a, true);
+        tails.track(&b, true);
+        assert_eq!(tails.poll(&a), vec!["one"]);
+        assert_eq!(tails.poll(&b), vec!["whole"]);
+
+        let mut cps = tails.checkpoints();
+        cps.sort_by(|x, y| x.0.cmp(&y.0));
+        let mut want = vec![
+            (
+                a.clone(),
+                TailCheckpoint {
+                    offset: 7,
+                    partial: b"ha\xC3".to_vec(),
+                },
+            ),
+            (
+                b.clone(),
+                TailCheckpoint {
+                    offset: 6,
+                    partial: Vec::new(),
+                },
+            ),
+        ];
+        want.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(cps, want);
+    }
+
+    #[test]
+    fn restore_never_replaces_an_existing_cursor() {
+        let path = temp_file("restore-existing");
+        std::fs::write(&path, "abc\n").unwrap();
+        let mut tails = MultiTail::default();
+        tails.track(&path, true);
+        tails.restore(
+            &path,
+            TailCheckpoint {
+                offset: 99,
+                partial: b"zzz".to_vec(),
+            },
+        );
+        assert_eq!(tails.poll(&path), vec!["abc"]);
+    }
+
     mod property {
         use super::*;
         use crate::cursor;

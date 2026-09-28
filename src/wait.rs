@@ -128,25 +128,41 @@ impl Outcome {
         }
     }
 
+    /// The object `--json` prints. Optional keys are omitted, not null.
+    fn to_json(&self) -> Value {
+        let mut v = json!({
+            "status": self.status,
+            "session": self.session,
+        });
+        let o = v.as_object_mut().unwrap();
+        if let Some(r) = &self.result {
+            o.insert("result".into(), json!(r));
+        }
+        if let Some(d) = self.duration_ms {
+            o.insert("duration_ms".into(), json!(d));
+        }
+        if !self.detail.is_empty() {
+            o.insert("detail".into(), json!(self.detail));
+        }
+        v
+    }
+
     fn print(&self, as_json: bool) {
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
+        self.emit(
+            as_json,
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr(),
+        );
+    }
+
+    /// Write the outcome: the answer or JSON object to `out`, anything a
+    /// caller should not capture as the answer to `err`.
+    fn emit(&self, as_json: bool, out: &mut impl std::io::Write, err: &mut impl std::io::Write) {
         if as_json {
-            let mut v = json!({
-                "status": self.status,
-                "session": self.session,
-            });
-            let o = v.as_object_mut().unwrap();
-            if let Some(r) = &self.result {
-                o.insert("result".into(), json!(r));
-            }
-            if let Some(d) = self.duration_ms {
-                o.insert("duration_ms".into(), json!(d));
-            }
-            if !self.detail.is_empty() {
-                o.insert("detail".into(), json!(self.detail));
-            }
-            query::line(&mut out, &serde_json::to_string(&v).unwrap_or_default());
+            query::line(
+                out,
+                &serde_json::to_string(&self.to_json()).unwrap_or_default(),
+            );
             return;
         }
         match self.status {
@@ -154,19 +170,16 @@ impl Outcome {
             // whole integration for a caller that only wants the text.
             "done" => {
                 if let Some(r) = &self.result {
-                    query::line(&mut out, r);
+                    query::line(out, r);
                 }
             }
             _ => {
-                eprintln!(
-                    "agentbus: {}{}",
-                    self.status,
-                    if self.detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {}", self.detail)
-                    }
-                );
+                let detail = if self.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", self.detail)
+                };
+                query::line(err, &format!("agentbus: {}{detail}", self.status));
             }
         }
     }
@@ -183,6 +196,19 @@ fn state_of(loc: &Locations, session: &str) -> Option<(String, String)> {
             .to_string()
     };
     Some((g("state"), g("detail")))
+}
+
+/// The `blocked` outcome, if the snapshot says the session is waiting on a
+/// prompt. The detail is the snapshot's own.
+fn blocked_outcome(loc: &Locations, session: &str) -> Option<Outcome> {
+    let (st, detail) = state_of(loc, session)?;
+    (st == "blocked").then(|| Outcome {
+        status: "blocked",
+        session: session.to_string(),
+        result: None,
+        duration_ms: None,
+        detail,
+    })
 }
 
 pub fn run(args: &[String], loc: &Locations) -> i32 {
@@ -276,19 +302,8 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
     // A session already sitting on a permission prompt is answered at once.
     // Waiting on one is how a supervisor burns its entire timeout: to anything
     // watching a screen it looks exactly like an agent thinking hard.
-    if let Some((st, detail)) = state_of(loc, &session) {
-        if st == "blocked" {
-            return finish(
-                Outcome {
-                    status: "blocked",
-                    session,
-                    result: None,
-                    duration_ms: None,
-                    detail,
-                },
-                a.json,
-            );
-        }
+    if let Some(o) = blocked_outcome(loc, &session) {
+        return finish(o, a.json);
     }
 
     loop {
@@ -312,19 +327,8 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
         // Checked every pass rather than only at entry: a permission prompt
         // usually arrives mid-turn, which is precisely the case a caller is
         // blocked on when it happens.
-        if let Some((st, detail)) = state_of(loc, &session) {
-            if st == "blocked" {
-                return finish(
-                    Outcome {
-                        status: "blocked",
-                        session,
-                        result: None,
-                        duration_ms: None,
-                        detail,
-                    },
-                    a.json,
-                );
-            }
+        if let Some(o) = blocked_outcome(loc, &session) {
+            return finish(o, a.json);
         }
 
         if Instant::now() >= deadline {
@@ -466,5 +470,282 @@ mod tests {
         );
         writer.join().unwrap();
         assert_eq!(code, OK);
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn write_snapshot(loc: &Locations, sessions: &str) {
+        std::fs::write(&loc.snapshot, format!(r#"{{"sessions":{sessions}}}"#)).unwrap();
+    }
+
+    fn outcome(status: &'static str) -> Outcome {
+        Outcome {
+            status,
+            session: "s".into(),
+            result: None,
+            duration_ms: None,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_blocked_session_returns_three_at_once_with_the_snapshot_detail() {
+        let loc = fixture("blocked");
+        write_snapshot(
+            &loc,
+            r#"[{"session":"s","state":"blocked","detail":"needs approval"}]"#,
+        );
+        let started = Instant::now();
+        let a = parse(&args(&["--session", "s", "--timeout", "30"]));
+        assert_eq!(a.timeout, Duration::from_secs(30));
+        let code = run(&args(&["--session", "s", "--timeout", "30"]), &loc);
+        assert_eq!(code, BLOCKED);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // The detail is the snapshot's, carried through to the outcome.
+        let o = blocked_outcome(&loc, "s").unwrap();
+        assert_eq!((o.status, o.session.as_str()), ("blocked", "s"));
+        assert_eq!(o.detail, "needs approval");
+        assert!(o.result.is_none() && o.duration_ms.is_none());
+        assert!(blocked_outcome(&loc, "nope").is_none());
+        write_snapshot(&loc, r#"[{"session":"s","state":"idle"}]"#);
+        assert!(blocked_outcome(&loc, "s").is_none());
+    }
+
+    #[test]
+    fn state_of_is_none_for_an_unknown_session() {
+        let loc = fixture("state-of-none");
+        assert_eq!(state_of(&loc, "nope"), None);
+        assert_eq!(
+            state_of(&loc, "s"),
+            Some(("idle".to_string(), String::new()))
+        );
+    }
+
+    #[test]
+    fn a_session_that_blocks_mid_wait_is_reported_blocked() {
+        let loc = fixture("blocks-later");
+        let writer_loc = loc.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            write_snapshot(
+                &writer_loc,
+                r#"[{"session":"s","state":"blocked","detail":"prompt"}]"#,
+            );
+        });
+        let started = Instant::now();
+        let code = run(&args(&["--session", "s", "--timeout", "30"]), &loc);
+        writer.join().unwrap();
+        assert_eq!(code, BLOCKED);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_finished_turn_beats_a_blocked_state_when_since_names_it() {
+        let loc = fixture("since-before-blocked");
+        write_completion(&loc);
+        write_snapshot(&loc, r#"[{"session":"s","state":"blocked"}]"#);
+        let since = crate::event::iso_to_epoch("2026-08-09T11:59:59Z")
+            .unwrap()
+            .to_string();
+        assert_eq!(run(&args(&["--session", "s", "--since", &since]), &loc), OK);
+    }
+
+    #[test]
+    fn json_output_carries_every_populated_key() {
+        let full = Outcome {
+            status: "done",
+            session: "s".into(),
+            result: Some("the answer".into()),
+            duration_ms: Some(42),
+            detail: "why".into(),
+        };
+        assert_eq!(
+            full.to_json(),
+            json!({
+                "status": "done",
+                "session": "s",
+                "result": "the answer",
+                "duration_ms": 42,
+                "detail": "why",
+            })
+        );
+    }
+
+    #[test]
+    fn json_output_omits_absent_optional_keys() {
+        let v = outcome("timeout").to_json();
+        assert_eq!(v, json!({"status": "timeout", "session": "s"}));
+    }
+
+    #[test]
+    fn done_builds_the_outcome_from_a_completion_record() {
+        let record = json!({"result": "short", "result_full": "long", "duration_ms": 9});
+        let o = done("s", &record);
+        assert_eq!(o.status, "done");
+        assert_eq!(o.session, "s");
+        assert_eq!(o.result.as_deref(), Some("long"));
+        assert_eq!(o.duration_ms, Some(9));
+        assert!(o.detail.is_empty());
+    }
+
+    #[test]
+    fn result_prefers_the_full_text_and_falls_back_to_the_preview() {
+        assert_eq!(
+            result_of(&json!({"result": "short", "result_full": "long"})).as_deref(),
+            Some("long")
+        );
+        assert_eq!(
+            result_of(&json!({"result": "short"})).as_deref(),
+            Some("short")
+        );
+        assert_eq!(result_of(&json!({"duration_ms": 1})), None);
+    }
+
+    #[test]
+    fn statuses_map_to_their_exit_codes() {
+        assert_eq!(outcome("done").code(), OK);
+        assert_eq!(outcome("expired").code(), ERR);
+        assert_eq!(outcome("blocked").code(), BLOCKED);
+        assert_eq!(outcome("timeout").code(), TIMEOUT);
+        assert_eq!(outcome("anything else").code(), ERR);
+        assert_ne!(BLOCKED, TIMEOUT);
+        assert_ne!(ERR, BLOCKED);
+    }
+
+    #[test]
+    fn an_expired_watermark_exits_one() {
+        let loc = fixture("expired");
+        write_completion(&loc);
+        // A floor two past the entry generation means the watermark itself
+        // is no longer retained.
+        let mut index = Index::load(&loc.completions);
+        index.floor = index.generation + 2;
+        assert!(index.write_atomic(&loc.completions));
+        let code = run(&args(&["--session", "s", "--timeout", "0"]), &loc);
+        assert_eq!(code, ERR);
+    }
+
+    #[test]
+    fn parse_reads_pid_cwd_session_timeout_since_and_json() {
+        let a = parse(&args(&[
+            "--pid",
+            "77",
+            "--cwd",
+            "/work",
+            "--session",
+            "abc",
+            "--timeout",
+            "5",
+            "--since",
+            "123",
+            "--json",
+        ]));
+        assert_eq!(a.filter.pid, Some(77));
+        assert_eq!(a.filter.cwd.as_deref(), Some("/work"));
+        assert_eq!(a.filter.session.as_deref(), Some("abc"));
+        assert_eq!(a.timeout, Duration::from_secs(5));
+        assert_eq!(a.since, Some(123));
+        assert!(a.json);
+        let none = parse(&[]);
+        assert!(none.filter.is_empty());
+        assert_eq!(none.timeout, DEFAULT_TIMEOUT);
+        assert!(!none.json && none.since.is_none());
+    }
+
+    #[test]
+    fn no_selector_is_a_usage_error() {
+        let loc = fixture("usage");
+        assert_eq!(run(&args(&["--timeout", "0"]), &loc), USAGE);
+    }
+
+    #[test]
+    fn cwd_reaches_the_filter() {
+        let loc = fixture("cwd");
+        write_snapshot(
+            &loc,
+            r#"[{"session":"a","state":"idle","cwd":"/work/a"},
+                {"session":"b","state":"blocked","cwd":"/work/b","detail":"d"}]"#,
+        );
+        // Only b matches, and b is the blocked one.
+        assert_eq!(
+            run(&args(&["--cwd", "/work/b", "--timeout", "0"]), &loc),
+            BLOCKED
+        );
+        assert_eq!(
+            run(&args(&["--cwd", "/work/a", "--timeout", "0"]), &loc),
+            TIMEOUT
+        );
+    }
+
+    #[test]
+    fn pid_reaches_the_filter() {
+        let loc = fixture("pid");
+        let me = std::process::id();
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let starttime: u64 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        write_snapshot(
+            &loc,
+            r#"[{"session":"a","state":"idle"},{"session":"b","state":"blocked"}]"#,
+        );
+        std::fs::write(
+            &loc.register,
+            format!(r#"{{"session_id":"b","pid":{me},"starttime":{starttime}}}"#) + "\n",
+        )
+        .unwrap();
+        assert_eq!(
+            run(&args(&["--pid", &me.to_string(), "--timeout", "0"]), &loc),
+            BLOCKED
+        );
+    }
+
+    fn emitted(o: &Outcome, as_json: bool) -> (String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        o.emit(as_json, &mut out, &mut err);
+        (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn done_prints_only_the_answer_on_stdout() {
+        let mut o = outcome("done");
+        o.result = Some("the answer".into());
+        assert_eq!(emitted(&o, false), ("the answer\n".into(), String::new()));
+        o.result = None;
+        assert_eq!(emitted(&o, false), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn other_statuses_print_a_diagnostic_on_stderr_only() {
+        let mut o = outcome("blocked");
+        o.detail = "needs approval".into();
+        assert_eq!(
+            emitted(&o, false),
+            (String::new(), "agentbus: blocked: needs approval\n".into())
+        );
+        assert_eq!(
+            emitted(&outcome("timeout"), false),
+            (String::new(), "agentbus: timeout\n".into())
+        );
+    }
+
+    #[test]
+    fn json_mode_prints_the_object_on_stdout_for_every_status() {
+        let (out, err) = emitted(&outcome("timeout"), true);
+        assert!(err.is_empty());
+        let v: Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v, json!({"status": "timeout", "session": "s"}));
     }
 }

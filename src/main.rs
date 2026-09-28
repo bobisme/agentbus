@@ -604,10 +604,12 @@ fn prime_stream(stream: &mut Stream, offset: u64) {
         return;
     };
     let mut reader = BufReader::new(file.take(offset));
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        let Ok(read) = reader.read_line(&mut line) else {
+        buf.clear();
+        // Bytes, not read_line: one line with invalid UTF-8 must not end
+        // priming. Decoding is lossy per complete line, like the live tail.
+        let Ok(read) = reader.read_until(b'\n', &mut buf) else {
             return;
         };
         if read == 0 {
@@ -616,9 +618,10 @@ fn prime_stream(stream: &mut Stream, offset: u64) {
         // A saved partial line is held by MultiTail and completed by the next
         // append. Feeding it to a JSON parser here would either do nothing or
         // reconstruct the wrong source state.
-        if !line.ends_with('\n') {
+        if buf.last() != Some(&b'\n') {
             return;
         }
+        let line = String::from_utf8_lossy(&buf);
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim_end()) else {
             continue;
         };
@@ -976,6 +979,48 @@ mod stream_checkpoint_tests {
         match &events[0].kind {
             Kind::TurnEnd { result_full, .. } => {
                 assert_eq!(result_full.as_deref(), Some("the full answer"));
+            }
+            other => panic!("expected turn_end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn priming_continues_past_a_line_with_invalid_utf8() {
+        let dir = std::env::temp_dir().join(format!("agentbus-prime-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "session",
+            "timestamp": "2026-08-09T12:00:00Z",
+            "message": { "content": [{ "type": "text", "text": "answer after bad bytes" }] }
+        });
+        let mut bytes = b"{\"type\":\"user\",\"text\":\"broken \xff\xfe byte\"}\n".to_vec();
+        bytes.extend_from_slice(format!("{assistant}\n").as_bytes());
+        // A trailing partial line must still be left alone.
+        bytes.extend_from_slice(b"{\"type\":\"assistant\",\"message\":");
+        std::fs::write(&path, &bytes).unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let found = discover::Found {
+            path: path.clone(),
+            source: Source::Claude,
+            parent_session: None,
+        };
+        let mut stream = new_stream(&found);
+        prime_stream(&mut stream, offset);
+
+        let end = serde_json::json!({
+            "type": "system",
+            "subtype": "turn_duration",
+            "sessionId": "session",
+            "timestamp": "2026-08-09T12:00:01Z",
+            "durationMs": 1000
+        });
+        let events = events_for(&mut stream, &end);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            Kind::TurnEnd { result_full, .. } => {
+                assert_eq!(result_full.as_deref(), Some("answer after bad bytes"));
             }
             other => panic!("expected turn_end, got {other:?}"),
         }
