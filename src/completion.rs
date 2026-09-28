@@ -9,6 +9,10 @@ use crate::event::{self, Event, Kind};
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Bumped only when a field is renamed, removed or changes meaning, the rule
+/// `event::SNAPSHOT_VERSION` follows. `pruned_epoch` arrived under 1 without
+/// one: it is additive, an older reader ignores it, and a file without it
+/// still loads (see `legacy_pruned_epoch`).
 const VERSION: u64 = 1;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
 
@@ -35,6 +39,12 @@ pub struct Index {
     /// Earliest generation that has not been discarded. A request below
     /// `floor - 1` has crossed retained history and must fail explicitly.
     pub floor: u64,
+    /// Newest timestamp (epoch seconds, as `record_epoch` reads it) of any
+    /// record ever discarded, or `None` if no record with a timestamp has
+    /// been. Monotone, like `floor`, and its counterpart for `newest_since`:
+    /// records are ordered by generation, not time, so a discarded record can
+    /// be newer than every retained one and only this can say so.
+    pub pruned_epoch: Option<u64>,
     records: Vec<Value>,
     limits: Limits,
 }
@@ -51,6 +61,7 @@ impl Default for Index {
         Self {
             generation: 0,
             floor: 1,
+            pruned_epoch: None,
             records: Vec::new(),
             limits: Limits::default(),
         }
@@ -70,7 +81,13 @@ impl Index {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default();
         };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        Self::decode(&text)
+    }
+
+    /// The inverse of `encode`. Limits are not persisted, so these are always
+    /// the defaults; a caller with others reapplies them.
+    fn decode(text: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
             return Self::default();
         };
         if value.get("version").and_then(Value::as_u64) != Some(VERSION) {
@@ -87,9 +104,14 @@ impl Index {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let pruned_epoch = match value.get("pruned_epoch") {
+            Some(field) => field.as_u64(),
+            None => legacy_pruned_epoch(floor, &records),
+        };
         Self {
             generation,
             floor,
+            pruned_epoch,
             records,
             limits: Limits::default(),
         }
@@ -149,8 +171,10 @@ impl Index {
         if let Some(record) = found {
             return Lookup::Found(record.clone());
         }
-        let oldest_timestamp = self.records.iter().find_map(record_epoch);
-        if self.floor > 1 && oldest_timestamp.is_some_and(|oldest| since < oldest) {
+        // Not "since is older than the oldest retained record": retention is
+        // by generation, so the first retained record need not be the oldest
+        // by time, and a discarded answer newer than `since` can sit behind it.
+        if self.pruned_epoch.is_some_and(|pruned| since <= pruned) {
             Lookup::Expired { floor: self.floor }
         } else {
             Lookup::Pending
@@ -162,6 +186,7 @@ impl Index {
             "version": VERSION,
             "generation": self.generation,
             "floor": self.floor,
+            "pruned_epoch": self.pruned_epoch,
             "records": self.records,
         }))
         .unwrap_or_default()
@@ -203,7 +228,35 @@ impl Index {
         if let Some(generation) = removed.get("generation").and_then(Value::as_u64) {
             self.floor = self.floor.max(generation.saturating_add(1));
         }
+        // A record with no timestamp at all is left out, and that is exact
+        // rather than lax: `newest_since` can never match such a record while
+        // it is retained, so discarding it cannot hide an answer. It only
+        // arises from a loaded file, since `push_events` stamps `retained_at`
+        // on anything whose `ts` does not parse.
+        if let Some(epoch) = record_epoch(&removed) {
+            self.pruned_epoch = Some(self.pruned_epoch.map_or(epoch, |seen| seen.max(epoch)));
+        }
     }
+}
+
+/// `pruned_epoch` for a file written before the field existed.
+///
+/// With `floor == 1` nothing was ever discarded, so `None` is exact. Past
+/// that, the discarded timestamps are unknowable, and the only sound value is
+/// "anything", `u64::MAX` — but the watermark never decreases, so that would
+/// turn every later `newest_since` miss into `Expired` for good, including
+/// the ordinary `wait --since` issued before the turn it names has ended.
+/// Instead take the newest retained timestamp. Every discarded record precedes
+/// every retained one in generation, so this covers each of them unless its
+/// timestamp is newer than the whole retained window, and it is strictly more
+/// conservative than the rule it replaces, which trusted the *first* retained
+/// record's. With nothing retained there is nothing to bound by; `None` keeps
+/// the old answer, `Pending`, for that case.
+fn legacy_pruned_epoch(floor: u64, records: &[Value]) -> Option<u64> {
+    if floor <= 1 {
+        return None;
+    }
+    records.iter().filter_map(record_epoch).max()
 }
 
 fn record_epoch(record: &Value) -> Option<u64> {
@@ -290,6 +343,76 @@ mod tests {
         assert_eq!(index.first_after("a", 0), Lookup::Expired { floor: 2 });
     }
 
+    /// bn-3s2. Retention is by generation, so with one record kept the
+    /// retained `b` is older than the discarded `a`; the old check compared
+    /// `since` with `b`'s timestamp and answered Pending, and `wait` then
+    /// blocked and returned a's *next* answer as this one.
+    #[test]
+    fn newest_since_expires_when_a_newer_answer_was_pruned_behind_an_older_one() {
+        let now = event::iso_to_epoch("2026-08-09T12:01:00Z").unwrap();
+        let mut index = Index::with_limits(Limits {
+            max_age_secs: u64::MAX,
+            max_records: 1,
+            max_bytes: usize::MAX,
+        });
+        index.push_events(&[completion("a", 50), completion("b", 10)], now);
+        let since = event::iso_to_epoch("2026-08-09T12:00:30Z").unwrap();
+        assert_eq!(index.newest_since("a", since), Lookup::Expired { floor: 2 });
+        let reloaded = Index::decode(&index.encode());
+        assert_eq!(
+            reloaded.newest_since("a", since),
+            Lookup::Expired { floor: 2 }
+        );
+        // Newer than anything discarded: still an honest wait.
+        let later = event::iso_to_epoch("2026-08-09T12:00:51Z").unwrap();
+        assert_eq!(index.newest_since("a", later), Lookup::Pending);
+    }
+
+    #[test]
+    fn legacy_file_without_pruned_epoch_takes_the_newest_retained_timestamp() {
+        let at =
+            |second: u64| event::iso_to_epoch(&format!("2026-08-09T12:00:{second:02}Z")).unwrap();
+        let legacy = |floor: u64| {
+            json!({
+                "version": VERSION,
+                "generation": 3,
+                "floor": floor,
+                "records": [
+                    {"ts": "2026-08-09T12:00:40Z", "session": "b", "generation": 2},
+                    {"ts": "2026-08-09T12:00:20Z", "session": "b", "generation": 3},
+                ],
+            })
+            .to_string()
+        };
+        assert_eq!(Index::decode(&legacy(2)).pruned_epoch, Some(at(40)));
+        assert_eq!(
+            Index::decode(&legacy(2)).newest_since("a", at(30)),
+            Lookup::Expired { floor: 2 }
+        );
+        assert_eq!(
+            Index::decode(&legacy(2)).newest_since("a", at(41)),
+            Lookup::Pending
+        );
+        assert_eq!(Index::decode(&legacy(1)).pruned_epoch, None);
+    }
+
+    #[test]
+    fn a_pruned_record_without_any_timestamp_does_not_move_the_watermark() {
+        let text = json!({
+            "version": VERSION,
+            "generation": 1,
+            "floor": 1,
+            "pruned_epoch": null,
+            "records": [{"session": "a", "generation": 1}],
+        })
+        .to_string();
+        let mut index = Index::decode(&text);
+        index.limits.max_records = 0;
+        index.prune(0);
+        assert_eq!((index.floor, index.pruned_epoch), (2, None));
+        assert_eq!(index.newest_since("a", 0), Lookup::Pending);
+    }
+
     #[test]
     fn atomic_file_round_trip_preserves_generation() {
         let now = event::iso_to_epoch("2026-08-09T12:01:00Z").unwrap();
@@ -302,5 +425,442 @@ mod tests {
         let loaded = Index::load(&path);
         assert_eq!(loaded.generation, 1);
         assert!(matches!(loaded.first_after("a", 0), Lookup::Found(_)));
+    }
+
+    /// bn-wo6: `Index` checked against an unbounded reference log.
+    ///
+    /// The contract `wait` rests on. With `r` the first reference record for
+    /// `s` with generation above `w`, `first_after(s, w)` is `Expired` exactly
+    /// when some record above `w` has been discarded (`w + 1 < floor`), and
+    /// otherwise `Found(r)` when `r` exists and `Pending` when it does not.
+    /// So it never answers `Pending` over a discarded `r`, and never with a
+    /// record other than `r`.
+    ///
+    /// With `r` the newest (highest-generation, the order turns were
+    /// published in) reference record for `s` with timestamp at or after
+    /// `since`, `newest_since(s, since)` is:
+    ///   - `Found(r)` if `r` is retained, and nothing else will do;
+    ///   - `Expired` if `r` was discarded;
+    ///   - with no `r`, `Pending`, or `Expired` provided some discarded record
+    ///     of *any* session has a timestamp at or after `since`. The index
+    ///     keeps one watermark rather than one per session, so it may refuse
+    ///     a wait it could have kept; it must never keep one it should refuse.
+    ///
+    /// Every `Expired` carries the index's current floor.
+    ///
+    /// After every step the structure holds: retained generations strictly
+    /// increase within `[floor, generation]` and match the reference record
+    /// of the same generation; everything below `floor` was discarded, so
+    /// retention is a suffix; `pruned_epoch` is the newest discarded
+    /// timestamp; and generation, floor and pruned_epoch never decrease.
+    ///
+    /// Sampled rather than proved, deliberately. Each operation preserves
+    /// this on its own — push, prune, encode/load and the two reads each take
+    /// a state satisfying it to one that does, and the monotone parts compose
+    /// by transitivity — so there is no inductive content a deductive
+    /// verifier would add beyond bookkeeping, and short random sequences with
+    /// small limits exercise every step from every shape of state that
+    /// matters.
+    mod model {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestCaseError, TestRunner};
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        const SESSIONS: [&str; 3] = ["a", "b", "c"];
+
+        fn base() -> u64 {
+            event::iso_to_epoch("2026-08-09T12:00:00Z").unwrap()
+        }
+
+        #[derive(Clone, Debug)]
+        enum Stamp {
+            At(u64),
+            Empty,
+            Garbage,
+        }
+
+        #[derive(Clone, Debug)]
+        struct Ev {
+            session: usize,
+            stamp: Stamp,
+            turn_end: bool,
+            long: bool,
+        }
+
+        /// A watermark either absolute or counted back from the current
+        /// generation, since with a retained window of a few records an
+        /// absolute one rarely lands inside it.
+        #[derive(Clone, Debug)]
+        enum Mark {
+            At(u64),
+            Back(u64),
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Push { events: Vec<Ev>, now: u64 },
+            RoundTrip,
+            FirstAfter { session: usize, watermark: Mark },
+            NewestSince { session: usize, since: u64 },
+        }
+
+        struct Reference {
+            generation: u64,
+            session: String,
+            epoch: u64,
+            marker: String,
+        }
+
+        /// How often each outcome the property is about was reached, so a
+        /// generator that stopped producing it fails loudly instead of
+        /// passing vacuously.
+        #[derive(Default)]
+        struct Seen {
+            pruned: AtomicUsize,
+            first_found: AtomicUsize,
+            first_pending: AtomicUsize,
+            first_expired: AtomicUsize,
+            since_found: AtomicUsize,
+            since_pending: AtomicUsize,
+            since_expired_required: AtomicUsize,
+            since_expired_allowed: AtomicUsize,
+            since_pruned_behind_older: AtomicUsize,
+        }
+
+        fn stamp() -> impl Strategy<Value = Stamp> {
+            prop_oneof![
+                8 => (0u64..90).prop_map(Stamp::At),
+                1 => Just(Stamp::Empty),
+                1 => Just(Stamp::Garbage),
+            ]
+        }
+
+        fn ev() -> impl Strategy<Value = Ev> {
+            (
+                0..SESSIONS.len(),
+                stamp(),
+                prop::bool::weighted(0.8),
+                prop::bool::weighted(0.1),
+            )
+                .prop_map(|(session, stamp, turn_end, long)| Ev {
+                    session,
+                    stamp,
+                    turn_end,
+                    long,
+                })
+        }
+
+        /// Watermarks and `since` values reach below the floor, exactly onto
+        /// retained generations and timestamps, and past the end.
+        fn op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                4 => (prop::collection::vec(ev(), 0..5), 0u64..200)
+                    .prop_map(|(events, now)| Op::Push { events, now: base() + now }),
+                1 => Just(Op::RoundTrip),
+                3 => (
+                    0..SESSIONS.len(),
+                    prop_oneof![
+                        4 => (0u64..40).prop_map(Mark::At),
+                        1 => Just(Mark::At(u64::MAX)),
+                        5 => (0u64..8).prop_map(Mark::Back),
+                    ],
+                )
+                    .prop_map(|(session, watermark)| Op::FirstAfter { session, watermark }),
+                3 => (0..SESSIONS.len(), prop_oneof![9 => (0u64..100).prop_map(|s| base() + s), 1 => Just(0u64)])
+                    .prop_map(|(session, since)| Op::NewestSince { session, since }),
+            ]
+        }
+
+        fn limits() -> impl Strategy<Value = Limits> {
+            (5u64..120, 1usize..5, 250usize..1500).prop_map(
+                |(max_age_secs, max_records, max_bytes)| Limits {
+                    max_age_secs,
+                    max_records,
+                    max_bytes,
+                },
+            )
+        }
+
+        fn to_event(e: &Ev, marker: &str) -> Event {
+            let ts = match e.stamp {
+                Stamp::At(offset) => {
+                    format!("2026-08-09T12:{:02}:{:02}Z", offset / 60, offset % 60)
+                }
+                Stamp::Empty => String::new(),
+                Stamp::Garbage => "yesterday-ish".into(),
+            };
+            let text = if e.long {
+                format!("{marker} {}", "x".repeat(400))
+            } else {
+                marker.to_string()
+            };
+            Event {
+                ts,
+                source: "test",
+                session: SESSIONS[e.session].into(),
+                kind: if e.turn_end {
+                    Kind::TurnEnd {
+                        duration_ms: Some(1),
+                        result: Some(marker.to_string()),
+                        result_full: Some(text),
+                    }
+                } else {
+                    Kind::Prompt { text }
+                },
+            }
+        }
+
+        fn generation_of(record: &Value) -> u64 {
+            record.get("generation").and_then(Value::as_u64).unwrap()
+        }
+
+        fn is(found: &Value, reference: &Reference) -> bool {
+            generation_of(found) == reference.generation
+                && found.get("session").and_then(Value::as_str) == Some(reference.session.as_str())
+                && found.get("result").and_then(Value::as_str) == Some(reference.marker.as_str())
+        }
+
+        fn run(limits: Limits, ops: &[Op], seen: &Seen) -> Result<(), TestCaseError> {
+            let mut index = Index::with_limits(limits);
+            let mut log: Vec<Reference> = Vec::new();
+            let mut previous = (index.generation, index.floor, index.pruned_epoch);
+            let mut markers = 0usize;
+
+            for op in ops {
+                match op {
+                    Op::Push { events, now } => {
+                        let before = index.records.len();
+                        let batch: Vec<Event> = events
+                            .iter()
+                            .map(|e| {
+                                markers += 1;
+                                to_event(e, &format!("m{markers}"))
+                            })
+                            .collect();
+                        for event in &batch {
+                            if let Kind::TurnEnd { result, .. } = &event.kind {
+                                log.push(Reference {
+                                    generation: log.len() as u64 + 1,
+                                    session: event.session.clone(),
+                                    epoch: event::iso_to_epoch(&event.ts).unwrap_or(*now),
+                                    marker: result.clone().unwrap(),
+                                });
+                            }
+                        }
+                        let changed = index.push_events(&batch, *now);
+                        prop_assert_eq!(
+                            changed,
+                            batch.iter().any(|e| matches!(e.kind, Kind::TurnEnd { .. }))
+                        );
+                        let added = log.len() as u64 - previous.0;
+                        if index.records.len() < before + added as usize {
+                            seen.pruned.fetch_add(1, Relaxed);
+                        }
+                    }
+                    Op::RoundTrip => {
+                        let mut loaded = Index::decode(&index.encode());
+                        // `load` resets limits to the defaults, which would
+                        // stop pruning; the publisher has its own, so reapply.
+                        loaded.limits = limits;
+                        prop_assert_eq!(loaded.generation, index.generation);
+                        prop_assert_eq!(loaded.floor, index.floor);
+                        prop_assert_eq!(loaded.pruned_epoch, index.pruned_epoch);
+                        prop_assert_eq!(&loaded.records, &index.records);
+                        index = loaded;
+                    }
+                    Op::FirstAfter { session, watermark } => {
+                        let session = SESSIONS[*session];
+                        let watermark = &match watermark {
+                            Mark::At(w) => *w,
+                            Mark::Back(k) => index.generation.saturating_sub(*k),
+                        };
+                        let floor = model_floor(&index, &log);
+                        let got = index.first_after(session, *watermark);
+                        let first = log
+                            .iter()
+                            .find(|r| r.session == session && r.generation > *watermark);
+                        if watermark.saturating_add(1) < floor {
+                            prop_assert_eq!(got, Lookup::Expired { floor: index.floor });
+                            seen.first_expired.fetch_add(1, Relaxed);
+                        } else if let Some(first) = first {
+                            match got {
+                                Lookup::Found(found) => prop_assert!(
+                                    is(&found, first),
+                                    "first_after({}, {}) = gen {}, reference gen {}",
+                                    session,
+                                    watermark,
+                                    generation_of(&found),
+                                    first.generation
+                                ),
+                                other => prop_assert!(
+                                    false,
+                                    "first_after({}, {}) = {:?}, reference gen {}",
+                                    session,
+                                    watermark,
+                                    other,
+                                    first.generation
+                                ),
+                            }
+                            seen.first_found.fetch_add(1, Relaxed);
+                        } else {
+                            prop_assert_eq!(got, Lookup::Pending);
+                            seen.first_pending.fetch_add(1, Relaxed);
+                        }
+                    }
+                    Op::NewestSince { session, since } => {
+                        let session = SESSIONS[*session];
+                        let floor = model_floor(&index, &log);
+                        let got = index.newest_since(session, *since);
+                        let newest = log
+                            .iter()
+                            .rev()
+                            .find(|r| r.session == session && r.epoch >= *since);
+                        let pruned_since = log
+                            .iter()
+                            .any(|r| r.generation < floor && r.epoch >= *since);
+                        match (newest, got) {
+                            (Some(newest), Lookup::Found(found)) => {
+                                prop_assert!(
+                                    newest.generation >= floor,
+                                    "found a discarded record"
+                                );
+                                prop_assert!(
+                                    is(&found, newest),
+                                    "newest_since({}, {}) = gen {}, reference gen {}",
+                                    session,
+                                    since,
+                                    generation_of(&found),
+                                    newest.generation
+                                );
+                                seen.since_found.fetch_add(1, Relaxed);
+                            }
+                            (Some(newest), Lookup::Expired { floor: reported }) => {
+                                prop_assert!(
+                                    newest.generation < floor,
+                                    "Expired over retained gen {}",
+                                    newest.generation
+                                );
+                                prop_assert_eq!(reported, index.floor);
+                                seen.since_expired_required.fetch_add(1, Relaxed);
+                                let older_first = index
+                                    .records
+                                    .first()
+                                    .and_then(record_epoch)
+                                    .is_some_and(|first| *since >= first);
+                                if older_first {
+                                    seen.since_pruned_behind_older.fetch_add(1, Relaxed);
+                                }
+                            }
+                            (None, Lookup::Pending) => {
+                                seen.since_pending.fetch_add(1, Relaxed);
+                            }
+                            (None, Lookup::Expired { floor: reported }) => {
+                                prop_assert!(pruned_since, "newest_since({}, {}) Expired with nothing discarded at or after it", session, since);
+                                prop_assert_eq!(reported, index.floor);
+                                seen.since_expired_allowed.fetch_add(1, Relaxed);
+                            }
+                            (newest, got) => prop_assert!(
+                                false,
+                                "newest_since({}, {}) = {:?}, reference gen {:?}, floor {}",
+                                session,
+                                since,
+                                got,
+                                newest.map(|r| r.generation),
+                                floor
+                            ),
+                        }
+                    }
+                }
+
+                // Structure, after every step.
+                prop_assert_eq!(index.generation, log.len() as u64);
+                let mut last = index.floor.saturating_sub(1);
+                for record in &index.records {
+                    let generation = generation_of(record);
+                    prop_assert!(
+                        generation > last,
+                        "retained generations out of order or below floor"
+                    );
+                    prop_assert!(generation <= index.generation);
+                    prop_assert!(
+                        is(record, &log[generation as usize - 1]),
+                        "retained gen {} differs from the reference",
+                        generation
+                    );
+                    last = generation;
+                }
+                let floor = model_floor(&index, &log);
+                prop_assert_eq!(
+                    index.floor,
+                    floor,
+                    "floor is not one past the newest discarded generation"
+                );
+                let pruned_epoch = log
+                    .iter()
+                    .filter(|r| r.generation < floor)
+                    .map(|r| r.epoch)
+                    .max();
+                prop_assert_eq!(index.pruned_epoch, pruned_epoch);
+                let now = (index.generation, index.floor, index.pruned_epoch);
+                prop_assert!(
+                    now.0 >= previous.0 && now.1 >= previous.1 && now.2 >= previous.2,
+                    "regressed: {:?} -> {:?}",
+                    previous,
+                    now
+                );
+                previous = now;
+            }
+            Ok(())
+        }
+
+        /// One past the newest reference generation the index no longer
+        /// holds, computed from the reference rather than read off `floor`.
+        fn model_floor(index: &Index, log: &[Reference]) -> u64 {
+            let retained: std::collections::BTreeSet<u64> =
+                index.records.iter().map(generation_of).collect();
+            log.iter()
+                .map(|r| r.generation)
+                .filter(|g| !retained.contains(g))
+                .max()
+                .map_or(1, |g| g + 1)
+        }
+
+        #[test]
+        fn index_agrees_with_an_unbounded_reference_log() {
+            let seen = Seen::default();
+            let mut runner = TestRunner::new(Config {
+                cases: 512,
+                ..Config::default()
+            });
+            let strategy = (limits(), prop::collection::vec(op(), 1..60));
+            runner
+                .run(&strategy, |(limits, ops)| run(limits, &ops, &seen))
+                .unwrap();
+
+            let counts = [
+                ("pruned", &seen.pruned),
+                ("first_after Found", &seen.first_found),
+                ("first_after Pending", &seen.first_pending),
+                ("first_after Expired", &seen.first_expired),
+                ("newest_since Found", &seen.since_found),
+                ("newest_since Pending", &seen.since_pending),
+                (
+                    "newest_since Expired over a discarded answer",
+                    &seen.since_expired_required,
+                ),
+                (
+                    "newest_since Expired, answer discarded behind an older retained record",
+                    &seen.since_pruned_behind_older,
+                ),
+                (
+                    "newest_since Expired with no answer",
+                    &seen.since_expired_allowed,
+                ),
+            ];
+            for (what, count) in counts {
+                assert!(count.load(Relaxed) > 0, "generator never reached: {what}");
+            }
+        }
     }
 }
