@@ -3,3 +3,5 @@ target/
 /.maw/
 /.manifold/
 /repo.git/
+mutants.out/
+mutants.out.old/
