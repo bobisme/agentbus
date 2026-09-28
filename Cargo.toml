@@ -17,3 +17,6 @@ signal-hook = "0.3"
 
 [profile.release]
 opt-level = 2
+
+[dev-dependencies]
+proptest = "1.11.0"

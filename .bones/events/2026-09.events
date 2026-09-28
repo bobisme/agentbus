@@ -17,3 +17,6 @@
 1790556950962518	agentbus-8lbb0p	itc:AQ		item.link	bn-33u	{"link_type":"blocks","target":"bn-wo6"}	blake3:-8CZHicOQZMTXHAj_UYGvh6_h0WmbvSrQvQTaCLw1Fo
 1790556951017602	agentbus-8lbb0p	itc:AQ		item.link	bn-33u	{"link_type":"blocks","target":"bn-n6g"}	blake3:peYxz95CKTuV1M8uSXZmur5ozekt1v0a7fkIu4iMEIM
 1790556952276990	agentbus-8lbb0p	itc:AQ		item.link	bn-28h	{"link_type":"related_to","target":"bn-3v2"}	blake3:y7G68xW4hAE8jOdtDDNxhgFgKQVSlhsqL1BxZn522mY
+1790632254433974	agentbus-8lbb0p	itc:AQ		item.move	bn-2i9	{"state":"doing"}	blake3:y-hZKYaZrpGsDhevHc-LfofxUZXEnd_l6jD8bYbfVx4
+1790632254437447	agentbus-8lbb0p	itc:AQ		item.assign	bn-2i9	{"action":"assign","agent":"agentbus-8lbb0p"}	blake3:OTxemvwew_ZQ_NCGxBSzyyZ1aPcqGv3hMJzC956K9cg
+1790632265021097	agentbus-8lbb0p	itc:AQ		item.move	bn-2i9	{"state":"done"}	blake3:kFbKot6mDohqP0LluMzuYMA4Rg36pS4tkxCYInXJ4z8
