@@ -6,11 +6,29 @@ anything can subscribe to.
 It observes Claude Code, Codex, OpenCode and agy (Antigravity CLI, Gemini),
 normalises them into one event vocabulary, and writes two things:
 
-- **an event log** — append-only JSONL, tailable and replayable
+- **an event log** — bounded JSONL generations, tailable and recently replayable
 - **a state snapshot** — what is true right now, for subscribers that only want that
 
-It renders nothing. Building a status bar, a notifier, or a multiplexer plugin on
-top is the point.
+The observer renders nothing. Building a status bar, a notifier, or a
+multiplexer plugin on top is the point; the same binary also includes a native
+reader for seeing the whole machine at once.
+
+## System-wide UI
+
+```bash
+agentbus ui          # verified running agents only
+agentbus ui --all    # include unverified and historical records
+```
+
+The default is deliberately strict. Recent transcripts and hook reports can
+remain after their process exits, so only a registration whose pid and process
+start time still match is presented as running. Press `a` to include everything
+the observer knows, `j`/`k` to move, `c` to change density, and `q` to leave.
+
+The native UI shows agents from every supported multiplexer as well as bare
+terminals, with the same normalised state, task, model, tool/context statistics,
+and nested subagents. Multiplexer-specific actions such as previewing or focusing
+a pane remain the responsibility of that multiplexer's subscriber.
 
 ## Install
 
@@ -128,6 +146,45 @@ It arrives in two spellings, because they have different jobs:
 Read `result_full`. `result` exists for renderers, and a consumer that took it
 for the answer silently lost everything past the first sentence.
 
+## Storage and retention
+
+The default state directory is `${XDG_STATE_HOME:-$HOME/.local/state}/agentbus`.
+Every artifact has a bounded role:
+
+| Path | Purpose | Bound |
+|---|---|---|
+| `events.jsonl` | Active verbose event generation | Rotates at 64 MiB |
+| `events.jsonl.*.sealed` | Recent verbose history | Seven days and 512 MiB total with the active log |
+| `completions.json` | Generation watermark plus ordered `turn_end` results for `wait` | Seven days, 10,000 records, 64 MiB |
+| `cursors.json` | Restart-safe transcript publication offsets | 10,000 existing transcripts |
+| `hook-spool/*.ready` | Lock-free durable hook ingress | Drained immediately; abandoned records age out after seven days or 64 MiB |
+| `inbox.jsonl` | Retained hook facts needed to reconstruct state | Seven days for timestamped records, 10,000 records, 64 MiB |
+| `register.jsonl` | Newest known registration per session | 10,000 sessions |
+
+The event limits can be changed with `--log-generation-mib`, `--log-max-mib`,
+and `--log-max-days`. The generation size is automatically clamped to the total
+cap. Follow the active pathname with `tail -F`, not `tail -f`: rotation renames a
+complete old generation and creates a new `events.jsonl`.
+
+`wait` does not read the verbose log. It takes a generation watermark from
+`completions.json`, before resolving the session, and selects the first matching
+completion after that generation. This keeps rotation out of the supervision
+correctness path. A `--since` older than retained completion history fails
+explicitly as `expired` (exit 1) instead of silently returning a newer or stale
+answer. Individual completion results larger than 1 MiB are marked and truncated
+in this bounded projection; the verbose event remains the diagnostic source.
+
+On first upgrade, an already-oversized `events.jsonl` is renamed with a
+`.legacy` suffix and deliberately excluded from automatic deletion. Verify the
+new publisher, completion waits, and subscriber state before removing that one
+file. Unknown files and symlinks are never retention candidates.
+
+Hooks write unique temporary files and atomically rename them to `.ready`; they
+never wait for the observer or take its publisher lock. The observer drains and
+deduplicates those records before compacting the legacy-compatible JSONL
+projections. A crash after journal append but before spool acknowledgement is
+therefore replay-safe.
+
 ## Asking
 
 Reading the snapshot file directly works, and every consumer that did it wrote
@@ -148,14 +205,16 @@ codex.
 
 **`wait` blocks until the current-or-next turn ends** and prints the full answer
 on stdout, or `{status, session, result, duration_ms}` with `--json`. It exits
-`0` done, `3` blocked, `4` timeout, `1` if the session could not be resolved.
+`0` done, `3` blocked, `4` timeout, `1` for resolution, observer, or retained
+history errors.
 `blocked` being distinct is the point of it: an agent sitting on a permission
 prompt looks exactly like a slow one to anything watching a screen, and burns
 the caller's whole timeout.
 
-It never reports a turn that ended before it started — internally a watermark on
-the event log, taken at entry. That is the one piece a caller cannot do for
-itself across two processes without persisting an offset to a file. The
+It never reports a turn that ended before it started — internally a generation
+watermark on the bounded completion index, taken at entry. That is the one piece
+a caller cannot do for itself across two processes without persisting shared
+state. The
 consequence is that a caller submitting first should mark the moment and say so:
 
 ```bash

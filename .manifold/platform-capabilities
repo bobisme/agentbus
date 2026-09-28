@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "reflink_supported": false,
+  "overlay_userns_supported": false,
+  "fuse_overlayfs_available": false,
+  "kernel_major": 7,
+  "kernel_minor": 2
+}

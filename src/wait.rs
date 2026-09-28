@@ -7,11 +7,11 @@
 //! 18% of the script, none of it domain logic.
 //!
 //! All of it is bookkeeping this process is better placed to do, being already
-//! a daemon tailing the event log. One of the steps is not merely tedious but
+//! the owner of the completion projection. One of the steps is not merely tedious but
 //! genuinely impossible for the caller to get right: see `WATERMARK` below.
 
+use crate::completion::{Index, Lookup};
 use crate::query::{self, Filter, Locations, Resolved};
-use crate::tail::MultiTail;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -36,15 +36,15 @@ const POLL: Duration = Duration::from_millis(150);
 /// Measured, a trivial codex turn completes in 1.1s, so even a 1s poll can
 /// straddle an entire turn and miss it in both directions.
 ///
-/// Here it is a byte offset on the event log taken before anything else
-/// happens, and only turn_ends appended after it can satisfy the wait. That
+/// Here it is a monotone generation from the bounded completion index, taken
+/// before anything else happens. Only turn_ends published after it satisfy the wait. That
 /// also makes "current-or-next" fall out for free rather than needing a rule: a
-/// turn already running ends after the offset, and so does a turn that has not
+/// turn already running ends after the generation, and so does a turn that has not
 /// started, while the one that ended before the call is behind it and
 /// unreachable.
 ///
 /// A caller cannot do this for itself across two processes without persisting
-/// the offset to a file — which is exactly what the supervisor this replaces
+/// the watermark to a file — which is exactly what the supervisor this replaces
 /// had to do.
 const _WATERMARK: () = ();
 
@@ -61,33 +61,6 @@ const _WATERMARK: () = ();
 /// So `--since <epoch>` is the caller's own reference point: shell `date +%s`
 /// before submitting, pass it here. It costs no file and no bookkeeping, which
 /// is what a caller had to do instead. Without it the behaviour is unchanged.
-fn turn_ended_since(log: &std::path::Path, session: &str, since: u64) -> Option<Value> {
-    let txt = std::fs::read_to_string(log).ok()?;
-    let mut best = None;
-    for l in txt.lines() {
-        let Ok(v) = serde_json::from_str::<Value>(l) else {
-            continue;
-        };
-        if v.get("session").and_then(|x| x.as_str()) != Some(session) {
-            continue;
-        }
-        if v.get("kind").and_then(|x| x.as_str()) != Some("turn_end") {
-            continue;
-        }
-        let at = v
-            .get("ts")
-            .and_then(|x| x.as_str())
-            .and_then(crate::event::iso_to_epoch);
-        // An undated turn_end cannot be placed relative to the caller's mark,
-        // and guessing would resurrect exactly the stale answer this exists to
-        // prevent. Later lines win, so the newest qualifying turn is returned.
-        if at.is_some_and(|t| t >= since) {
-            best = Some(v);
-        }
-    }
-    best
-}
-
 struct Args {
     filter: Filter,
     timeout: Duration,
@@ -150,6 +123,7 @@ impl Outcome {
             "done" => OK,
             "blocked" => BLOCKED,
             "timeout" => TIMEOUT,
+            "expired" => ERR,
             _ => ERR,
         }
     }
@@ -222,8 +196,7 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
     // a turn that ends during resolution is still caught: resolving reads the
     // snapshot and the register off disk, which is not instant, and a fast turn
     // fits inside it.
-    let mut tails = MultiTail::default();
-    tails.track(&loc.log, false);
+    let entry_generation = Index::load(&loc.completions).generation;
 
     let deadline = Instant::now() + a.timeout;
 
@@ -282,17 +255,21 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
     // agent that answered and then hit a permission prompt on the *next* thing
     // has still answered the question being waited on.
     if let Some(since) = a.since {
-        if let Some(v) = turn_ended_since(&loc.log, &session, since) {
-            return finish(
-                Outcome {
-                    status: "done",
-                    session,
-                    result: result_of(&v),
-                    duration_ms: v.get("duration_ms").and_then(|x| x.as_u64()),
-                    detail: String::new(),
-                },
-                a.json,
-            );
+        match Index::load(&loc.completions).newest_since(&session, since) {
+            Lookup::Found(record) => return finish(done(&session, &record), a.json),
+            Lookup::Expired { floor } => {
+                return finish(
+                    Outcome {
+                        status: "expired",
+                        session,
+                        result: None,
+                        duration_ms: None,
+                        detail: format!("completion history before generation {floor} has expired"),
+                    },
+                    a.json,
+                );
+            }
+            Lookup::Pending => {}
         }
     }
 
@@ -315,26 +292,21 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
     }
 
     loop {
-        for line in tails.poll(&loc.log) {
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if v.get("session").and_then(|x| x.as_str()) != Some(session.as_str()) {
-                continue;
+        match Index::load(&loc.completions).first_after(&session, entry_generation) {
+            Lookup::Found(record) => return finish(done(&session, &record), a.json),
+            Lookup::Expired { floor } => {
+                return finish(
+                    Outcome {
+                        status: "expired",
+                        session,
+                        result: None,
+                        duration_ms: None,
+                        detail: format!("completion watermark expired before generation {floor}"),
+                    },
+                    a.json,
+                );
             }
-            if v.get("kind").and_then(|x| x.as_str()) != Some("turn_end") {
-                continue;
-            }
-            return finish(
-                Outcome {
-                    status: "done",
-                    session,
-                    result: result_of(&v),
-                    duration_ms: v.get("duration_ms").and_then(|x| x.as_u64()),
-                    detail: String::new(),
-                },
-                a.json,
-            );
+            Lookup::Pending => {}
         }
 
         // Checked every pass rather than only at entry: a permission prompt
@@ -371,7 +343,128 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
     }
 }
 
+fn done(session: &str, record: &Value) -> Outcome {
+    Outcome {
+        status: "done",
+        session: session.to_string(),
+        result: result_of(record),
+        duration_ms: record.get("duration_ms").and_then(Value::as_u64),
+        detail: String::new(),
+    }
+}
+
 fn finish(o: Outcome, as_json: bool) -> i32 {
     o.print(as_json);
     o.code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{Event, Kind};
+
+    fn fixture(name: &str) -> Locations {
+        let dir = std::env::temp_dir().join(format!("agentbus-wait-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = dir.join("snapshot.json");
+        std::fs::write(
+            &snapshot,
+            r#"{"sessions":[{"session":"s","state":"idle"}]}"#,
+        )
+        .unwrap();
+        Locations {
+            snapshot,
+            log: dir.join("events.jsonl"),
+            register: dir.join("register.jsonl"),
+            completions: dir.join("completions.json"),
+        }
+    }
+
+    fn write_completion(loc: &Locations) {
+        let event = Event {
+            ts: "2026-08-09T12:00:00Z".into(),
+            source: "test",
+            session: "s".into(),
+            kind: Kind::TurnEnd {
+                duration_ms: Some(7),
+                result: Some("answer".into()),
+                result_full: Some("full answer".into()),
+            },
+        };
+        let mut index = Index::default();
+        index.push_events(
+            &[event],
+            crate::event::iso_to_epoch("2026-08-09T12:00:01Z").unwrap(),
+        );
+        assert!(index.write_atomic(&loc.completions));
+    }
+
+    #[test]
+    fn entry_generation_rejects_a_stale_answer() {
+        let loc = fixture("stale");
+        write_completion(&loc);
+        assert_eq!(
+            run(
+                &[
+                    "--session".into(),
+                    "s".into(),
+                    "--timeout".into(),
+                    "0".into()
+                ],
+                &loc,
+            ),
+            TIMEOUT
+        );
+    }
+
+    #[test]
+    fn since_finds_a_retained_completion_without_the_verbose_log() {
+        let loc = fixture("since");
+        write_completion(&loc);
+        assert!(!loc.log.exists());
+        let since = crate::event::iso_to_epoch("2026-08-09T11:59:59Z")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            run(
+                &[
+                    "--session".into(),
+                    "s".into(),
+                    "--since".into(),
+                    since,
+                    "--json".into(),
+                ],
+                &loc,
+            ),
+            OK
+        );
+    }
+
+    #[test]
+    fn completion_during_session_resolution_is_not_missed() {
+        let loc = fixture("resolution-race");
+        std::fs::write(&loc.snapshot, r#"{"sessions":[]}"#).unwrap();
+        let writer_loc = loc.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            write_completion(&writer_loc);
+            std::fs::write(
+                &writer_loc.snapshot,
+                r#"{"sessions":[{"session":"s","state":"idle"}]}"#,
+            )
+            .unwrap();
+        });
+        let code = run(
+            &[
+                "--session".into(),
+                "s".into(),
+                "--timeout".into(),
+                "2".into(),
+            ],
+            &loc,
+        );
+        writer.join().unwrap();
+        assert_eq!(code, OK);
+    }
 }

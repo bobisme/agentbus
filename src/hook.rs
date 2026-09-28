@@ -6,25 +6,31 @@
 //! observer already reads. A hook fires on every prompt and every subagent, so
 //! that cost is paid constantly.
 //!
-//! Hooks publish onto the bus; they never talk to zellij. Two destinations,
-//! because the two kinds of report have different truth semantics:
+//! Hooks publish onto the bus; they never talk to zellij. Each invocation writes
+//! one unique temporary file and atomically renames it ready. The observer then
+//! drains two logical destinations with different truth semantics:
 //!
 //!   register.jsonl — idempotent facts (this session lives in this pane),
-//!                    re-read wholesale, so truncation is harmless.
-//!   inbox.jsonl    — events (a subagent started), tailed like a transcript.
+//!                    compacted to the newest fact per session.
+//!   inbox.jsonl    — retained events (a subagent started), bounded and tailed
+//!                    like a transcript.
 //!
 //! Every path exits 0. A monitoring hook must never be able to wedge an agent.
 
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Appends of this size or less are atomic under O_APPEND on Linux, which is
-/// what lets several agents write one file with no locking. Every line is
-/// clamped to stay below it.
+/// Upper bound for one atomic spool record and the legacy append fallback.
 const ATOMIC_LIMIT: usize = 4096;
+const JOURNAL_MAX_RECORDS: usize = 10_000;
+const JOURNAL_MAX_BYTES: usize = 64 * 1024 * 1024;
+const JOURNAL_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+static SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub fn run(args: &[String], register: &Path, inbox: &Path) {
+pub fn run(args: &[String], register: &Path, inbox: &Path, spool: &Path) {
     let event = args.first().map(|s| s.as_str()).unwrap_or("");
 
     // Only read stdin when it is a pipe. An agent delivering a hook payload
@@ -40,14 +46,15 @@ pub fn run(args: &[String], register: &Path, inbox: &Path) {
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
 
     match event {
-        "register" => register_session(&payload, register, inbox),
-        "turn-end" => turn_end(&payload, inbox),
-        "subagent" => subagent(&payload, args.get(1).map(|s| s.as_str()), inbox),
+        "register" => register_session(&payload, register, inbox, spool),
+        "turn-end" => turn_end(&payload, inbox, spool),
+        "subagent" => subagent(&payload, args.get(1).map(|s| s.as_str()), inbox, spool),
         "state" => state(
             &payload,
             args.get(1).map(|s| s.as_str()),
             args.get(2),
             inbox,
+            spool,
         ),
         _ => {}
     }
@@ -151,7 +158,7 @@ fn clean(v: &str, max: usize) -> String {
     }
 }
 
-fn append(path: &Path, line: &str) {
+fn append_legacy(path: &Path, line: &str) {
     if line.len() > ATOMIC_LIMIT {
         return;
     }
@@ -164,6 +171,50 @@ fn append(path: &Path, line: &str) {
         .open(path)
     {
         let _ = writeln!(f, "{line}");
+    }
+}
+
+fn enqueue(spool: &Path, channel: &str, payload: Value) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let id = format!(
+        "{:020}-{:09}-{:010}-{sequence:06}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        std::process::id()
+    );
+    let record = json!({
+        "version": 1,
+        "id": id,
+        "channel": channel,
+        "queued_at": now.as_secs(),
+        "payload": payload,
+    });
+    let text = record.to_string();
+    if text.len() > ATOMIC_LIMIT || std::fs::create_dir_all(spool).is_err() {
+        return false;
+    }
+    let tmp = spool.join(format!("{id}.tmp"));
+    let ready = spool.join(format!("{id}.ready"));
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+    else {
+        return false;
+    };
+    if file.write_all(text.as_bytes()).is_err() {
+        return false;
+    }
+    drop(file);
+    std::fs::rename(tmp, ready).is_ok()
+}
+
+fn publish(spool: &Path, channel: &str, legacy: &Path, payload: Value) {
+    if !enqueue(spool, channel, payload.clone()) {
+        append_legacy(legacy, &payload.to_string());
     }
 }
 
@@ -224,7 +275,7 @@ fn agent_pid() -> u32 {
     0
 }
 
-fn register_session(p: &Value, register: &Path, inbox: &Path) {
+fn register_session(p: &Value, register: &Path, inbox: &Path, spool: &Path) {
     // A subagent shares its parent's pane and must not register as a session of
     // its own; it already appears nested under the parent.
     if !s(p, "agent_id").is_empty() {
@@ -240,15 +291,16 @@ fn register_session(p: &Value, register: &Path, inbox: &Path) {
     // anonymous one from its first prompt rather than its first finished turn.
     let (cwd, model) = (cwd_of(p), first(p, &["modelName", "model"]));
     if !cwd.is_empty() || !model.is_empty() {
-        append(
+        publish(
+            spool,
+            "inbox",
             inbox,
-            &json!({
+            json!({
                 "kind": "session",
                 "session": session,
                 "cwd": cwd,
                 "model": model,
-            })
-            .to_string(),
+            }),
         );
     }
     // A record is written even with no pane to put in it. Most of what this
@@ -269,7 +321,7 @@ fn register_session(p: &Value, register: &Path, inbox: &Path) {
         "pid": pid,
         "starttime": starttime(pid),
     });
-    append(register, &line.to_string());
+    publish(spool, "register", register, line);
 }
 
 /// The end of a turn, for a host that writes no record of one.
@@ -284,7 +336,7 @@ fn register_session(p: &Value, register: &Path, inbox: &Path) {
 /// `ATOMIC_LIMIT`, and an over-long line is dropped whole and without complaint,
 /// which would lose precisely the answers worth reading. The transcript path
 /// goes instead and the observer reads it — it is already tailing that file.
-fn turn_end(p: &Value, inbox: &Path) {
+fn turn_end(p: &Value, inbox: &Path, spool: &Path) {
     let session = first(p, SESSION_KEYS);
     if session.is_empty() {
         return;
@@ -296,10 +348,10 @@ fn turn_end(p: &Value, inbox: &Path) {
         "cwd": cwd_of(p),
         "model": first(p, &["modelName", "model"]),
     });
-    append(inbox, &line.to_string());
+    publish(spool, "inbox", inbox, line);
 }
 
-fn subagent(p: &Value, phase: Option<&str>, inbox: &Path) {
+fn subagent(p: &Value, phase: Option<&str>, inbox: &Path, spool: &Path) {
     let agent_id = s(p, "agent_id");
     let session = s(p, "session_id");
     if agent_id.is_empty() || session.is_empty() {
@@ -317,12 +369,12 @@ fn subagent(p: &Value, phase: Option<&str>, inbox: &Path) {
         "description": clean(&s(p, "description"), 120),
         "result": clean(&s(p, "last_assistant_message"), 160),
     });
-    append(inbox, &line.to_string());
+    publish(spool, "inbox", inbox, line);
 }
 
 /// Report from an agent whose state cannot be read off disk — currently
 /// OpenCode, whose plugin API sees transitions that reach no transcript.
-fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path) {
+fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path, spool: &Path) {
     let Some(st) = st else { return };
     let (mux, mux_session, pane) = location();
     let pid = agent_pid();
@@ -348,9 +400,304 @@ fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path) {
         "pid": pid,
         "starttime": starttime(pid),
     });
-    append(inbox, &line.to_string());
+    publish(spool, "inbox", inbox, line);
 }
 
 pub fn default_inbox(state_dir: &Path) -> PathBuf {
     state_dir.join("inbox.jsonl")
+}
+
+pub fn default_spool(state_dir: &Path) -> PathBuf {
+    state_dir.join("hook-spool")
+}
+
+/// Move ready spool records into observer-owned journals, deduplicating the
+/// crash window between durable append and spool acknowledgement.
+pub fn drain_to_journals(spool: &Path, register: &Path, inbox: &Path) -> bool {
+    let mut ready: Vec<PathBuf> = std::fs::read_dir(spool)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "ready"))
+                .collect()
+        })
+        .unwrap_or_default();
+    ready.sort();
+    if ready.is_empty() {
+        return false;
+    }
+    let mut seen = spool_ids(register);
+    seen.extend(spool_ids(inbox));
+    let mut register_lines = Vec::new();
+    let mut inbox_lines = Vec::new();
+    let mut register_files = Vec::new();
+    let mut inbox_files = Vec::new();
+    let mut duplicate_files = Vec::new();
+    for path in ready {
+        let Some(record) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            continue;
+        };
+        let Some(id) = record.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.contains(id) {
+            duplicate_files.push(path);
+            continue;
+        }
+        let channel = record.get("channel").and_then(Value::as_str).unwrap_or("");
+        let Some(mut payload) = record.get("payload").cloned() else {
+            continue;
+        };
+        let Some(object) = payload.as_object_mut() else {
+            continue;
+        };
+        object.insert("_spool_id".into(), json!(id));
+        object.insert(
+            "_spooled_at".into(),
+            record.get("queued_at").cloned().unwrap_or(json!(0)),
+        );
+        match channel {
+            "register" => {
+                register_lines.push(payload.to_string());
+                register_files.push(path);
+            }
+            "inbox" => {
+                inbox_lines.push(payload.to_string());
+                inbox_files.push(path);
+            }
+            _ => {}
+        }
+        seen.insert(id.to_string());
+    }
+    let register_ok = append_lines(register, &register_lines);
+    let inbox_ok = append_lines(inbox, &inbox_lines);
+    if register_ok {
+        acknowledge(&register_files);
+    }
+    if inbox_ok {
+        acknowledge(&inbox_files);
+    }
+    acknowledge(&duplicate_files);
+    (register_ok && !register_lines.is_empty()) || (inbox_ok && !inbox_lines.is_empty())
+}
+
+fn append_lines(path: &Path, lines: &[String]) -> bool {
+    if lines.is_empty() {
+        return true;
+    }
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return false;
+        }
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut text = lines.join("\n");
+    text.push('\n');
+    file.write_all(text.as_bytes()).is_ok() && file.sync_data().is_ok()
+}
+
+fn acknowledge(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn spool_ids(path: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .into_iter()
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|value| {
+                    value
+                        .get("_spool_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Compact the observer-owned inbox after its current cursor has consumed it.
+pub fn compact_inbox(path: &Path, now: u64) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let cutoff = now.saturating_sub(JOURNAL_MAX_AGE_SECS);
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let value = serde_json::from_str::<Value>(line).ok()?;
+            let queued = value.get("_spooled_at").and_then(Value::as_u64);
+            if queued.is_some_and(|timestamp| timestamp < cutoff) {
+                return None;
+            }
+            Some(value.to_string())
+        })
+        .collect();
+    if lines.len() > JOURNAL_MAX_RECORDS {
+        lines.drain(..lines.len() - JOURNAL_MAX_RECORDS);
+    }
+    while lines.len() > 1
+        && lines.iter().map(|line| line.len() + 1).sum::<usize>() > JOURNAL_MAX_BYTES
+    {
+        lines.remove(0);
+    }
+    let mut compacted = lines.join("\n");
+    if !compacted.is_empty() {
+        compacted.push('\n');
+    }
+    if compacted == text {
+        return false;
+    }
+    write_atomic(path, &compacted)
+}
+
+/// Bound abandoned ready/temporary spool files after attempting a normal drain.
+/// Only regular files in the agentbus naming namespace are candidates.
+pub fn prune_spool(spool: &Path, now: u64) -> usize {
+    let cutoff = now.saturating_sub(JOURNAL_MAX_AGE_SECS);
+    let mut files: Vec<(PathBuf, u64, u64)> = std::fs::read_dir(spool)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let extension = path.extension().and_then(|value| value.to_str());
+                    if !matches!(extension, Some("ready" | "tmp")) {
+                        return None;
+                    }
+                    let file_type = entry.file_type().ok()?;
+                    if !file_type.is_file() || file_type.is_symlink() {
+                        return None;
+                    }
+                    let metadata = entry.metadata().ok()?;
+                    let modified = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or(0);
+                    Some((path, metadata.len(), modified))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by_key(|(_, _, modified)| *modified);
+    let mut removed = 0;
+    for (path, _, modified) in &files {
+        if *modified < cutoff && std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    files.retain(|(path, _, _)| path.exists());
+    let mut total = files.iter().map(|(_, bytes, _)| *bytes).sum::<u64>();
+    for (path, bytes, _) in files {
+        if total <= JOURNAL_MAX_BYTES as u64 {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(bytes);
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn write_atomic(path: &Path, text: &str) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, text).is_ok() && std::fs::rename(tmp, path).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("agentbus-hook-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (
+            dir.join("spool"),
+            dir.join("register.jsonl"),
+            dir.join("inbox.jsonl"),
+        )
+    }
+
+    #[test]
+    fn concurrent_hook_records_do_not_overwrite_each_other() {
+        let (spool, register, inbox) = fixture("concurrent");
+        let mut workers = Vec::new();
+        for n in 0..16 {
+            let spool = spool.clone();
+            workers.push(std::thread::spawn(move || {
+                assert!(enqueue(
+                    &spool,
+                    "inbox",
+                    json!({"kind":"state", "session":format!("s-{n}")})
+                ));
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 16);
+        assert!(drain_to_journals(&spool, &register, &inbox));
+        assert_eq!(std::fs::read_to_string(inbox).unwrap().lines().count(), 16);
+        assert_eq!(std::fs::read_dir(spool).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn replayed_spool_record_is_deduplicated_after_append_before_ack() {
+        let (spool, register, inbox) = fixture("dedup");
+        assert!(enqueue(
+            &spool,
+            "inbox",
+            json!({"kind":"state", "session":"s"})
+        ));
+        let original = std::fs::read_dir(&spool)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let record = std::fs::read_to_string(&original).unwrap();
+        assert!(drain_to_journals(&spool, &register, &inbox));
+        std::fs::write(spool.join("replayed.ready"), record).unwrap();
+        assert!(!drain_to_journals(&spool, &register, &inbox));
+        assert_eq!(std::fs::read_to_string(inbox).unwrap().lines().count(), 1);
+        assert_eq!(std::fs::read_dir(spool).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn inbox_compaction_expires_timestamped_history() {
+        let (_, _, inbox) = fixture("compact");
+        std::fs::write(
+            &inbox,
+            "{\"kind\":\"state\",\"session\":\"old\",\"_spooled_at\":1}\n{\"kind\":\"state\",\"session\":\"new\",\"_spooled_at\":1000}\n",
+        )
+        .unwrap();
+        assert!(compact_inbox(&inbox, 1000 + JOURNAL_MAX_AGE_SECS));
+        let text = std::fs::read_to_string(inbox).unwrap();
+        assert!(!text.contains("old"));
+        assert!(text.contains("new"));
+    }
 }

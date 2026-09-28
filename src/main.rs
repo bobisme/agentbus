@@ -3,7 +3,7 @@
 //! Prototype of the observer half of the herd split. It tails agent transcripts
 //! on disk, normalises them into one vocabulary, and publishes two things:
 //!
-//!   - an append-only event log   (subscribers tail it; replayable, `tail -f`able)
+//!   - bounded event generations (subscribers follow the active path with `tail -F`)
 //!   - a snapshot of current state (subscribers that only want "what is true now")
 //!
 //! Why transcripts rather than hooks: they need no agent cooperation, carry far
@@ -24,18 +24,23 @@
 mod agy;
 mod claude;
 mod codex;
+mod completion;
+mod cursor;
 mod discover;
 mod event;
+mod event_log;
 mod hook;
+mod publish_lock;
 mod query;
 mod register;
 mod tail;
+mod ui;
 mod wait;
 
 use discover::Source;
 use event::{Event, Kind, Snapshot};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -47,6 +52,7 @@ USAGE:
     agentbus scan               Fold recent history once, print the snapshot
     agentbus events             Follow and print events to stdout only
     agentbus sessions           Query current state (see ASKING, below)
+    agentbus ui                 Interactive system-wide agent roster
     agentbus wait               Block until a turn ends, and say what it said
     agentbus hook register      Publish this session's pane (from a hook)
     agentbus hook subagent start|stop
@@ -54,6 +60,7 @@ USAGE:
 
 ASKING:
     agentbus sessions [--pid N] [--session S] [--cwd D] [--json]
+    agentbus ui [--all]
     agentbus wait (--session S | --pid N) [--timeout SECS] [--since EPOCH] [--json]
 
     --pid matches the named process or any descendant of it, so a supervisor
@@ -65,7 +72,7 @@ ASKING:
     in the gap is missed.
 
     wait exits 0 when the turn ended, 3 if the agent is blocked on a prompt,
-    4 on timeout, 1 if the session could not be resolved.
+    4 on timeout, 1 on resolution, observer, or retained-history errors.
 
 OPTIONS:
     --within <MINS>   How recently a transcript must have changed (default 30)
@@ -73,6 +80,10 @@ OPTIONS:
     --snapshot <PATH> Where to write state   (default: state dir)
     --log <PATH>      Where to append events (default: state dir)
     --register <PATH> Session->pane registrations (default: state dir)
+    --completions <PATH> Bounded turn completion index (default: state dir)
+    --log-generation-mib <N> Rotate active log at MiB (default: 64)
+    --log-max-mib <N> Total active and sealed log MiB (default: 512)
+    --log-max-days <N> Maximum sealed history age (default: 7)
     --result-ttl <S>  How long a finished subagent's result stays published (90)
     --no-publish      Do not write snapshot or log
 ";
@@ -83,17 +94,24 @@ fn main() {
         eprint!("{USAGE}");
         std::process::exit(2);
     }
-    let opts = Opts::parse(&args);
+    let mut opts = Opts::parse(&args);
     match args[0].as_str() {
-        "hook" => hook::run(&args[1..], &opts.register, &opts.inbox),
-        "watch" => run(&opts, true, true),
-        "events" => run(&opts, true, false),
-        "scan" => run(&opts, false, true),
+        "hook" => hook::run(&args[1..], &opts.register, &opts.inbox, &opts.spool),
+        "watch" => std::process::exit(run(&opts, true, true)),
+        "events" => {
+            // This verb is a reader that prints normalized live events. It must
+            // remain usable beside the publisher and must never mutate shared
+            // cursors, hook journals, or retained history.
+            opts.publish = false;
+            std::process::exit(run(&opts, true, false));
+        }
+        "scan" => std::process::exit(run(&opts, false, true)),
         // The reading verbs answer from what the observer published, so they
         // resolve its locations rather than assuming the defaults: the service
         // is routinely pointed elsewhere, and a reader guessing wrong reads a
         // stale file and reports nothing wrong.
         "sessions" => std::process::exit(query::run(&args[1..], &opts.resolved())),
+        "ui" => std::process::exit(ui::run(&args[1..], &opts.resolved())),
         "wait" => std::process::exit(wait::run(&args[1..], &opts.resolved())),
         "-h" | "--help" | "help" => print!("{USAGE}"),
         other => {
@@ -110,7 +128,10 @@ struct Opts {
     snapshot: PathBuf,
     log: PathBuf,
     register: PathBuf,
+    completions: PathBuf,
+    event_log_limits: event_log::Limits,
     inbox: PathBuf,
+    spool: PathBuf,
     /// Set when --snapshot was given. A pinned path may point into a directory
     /// created later by something else, so it is written only once that exists
     /// rather than being created here.
@@ -128,7 +149,10 @@ impl Opts {
             snapshot_pinned: false,
             log: state_dir().join("events.jsonl"),
             register: state_dir().join("register.jsonl"),
+            completions: state_dir().join("completions.json"),
+            event_log_limits: event_log::Limits::default(),
             inbox: hook::default_inbox(&state_dir()),
+            spool: hook::default_spool(&state_dir()),
             result_ttl: event::RESULT_TTL,
             publish: true,
         };
@@ -162,6 +186,26 @@ impl Opts {
                         o.register = PathBuf::from(v);
                     }
                 }
+                "--completions" => {
+                    if let Some(v) = next {
+                        o.completions = PathBuf::from(v);
+                    }
+                }
+                "--log-generation-mib" => {
+                    if let Some(v) = next.and_then(|v| v.parse::<u64>().ok()) {
+                        o.event_log_limits.generation_bytes = v.saturating_mul(1024 * 1024).max(1);
+                    }
+                }
+                "--log-max-mib" => {
+                    if let Some(v) = next.and_then(|v| v.parse::<u64>().ok()) {
+                        o.event_log_limits.max_bytes = v.saturating_mul(1024 * 1024).max(1);
+                    }
+                }
+                "--log-max-days" => {
+                    if let Some(v) = next.and_then(|v| v.parse::<u64>().ok()) {
+                        o.event_log_limits.max_age_secs = v.saturating_mul(24 * 60 * 60);
+                    }
+                }
                 "--result-ttl" => {
                     if let Some(v) = next.and_then(|v| v.parse::<u64>().ok()) {
                         o.result_ttl = Duration::from_secs(v);
@@ -172,6 +216,10 @@ impl Opts {
             }
             i += 1;
         }
+        o.event_log_limits.generation_bytes = o
+            .event_log_limits
+            .generation_bytes
+            .min(o.event_log_limits.max_bytes);
         o
     }
 
@@ -181,6 +229,7 @@ impl Opts {
             snapshot: self.snapshot.clone(),
             log: self.log.clone(),
             register: self.register.clone(),
+            completions: self.completions.clone(),
         }
     }
 
@@ -229,7 +278,18 @@ struct Stream {
     turn: claude::Turn,
 }
 
-fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
+fn run(opts: &Opts, follow: bool, print_snapshot: bool) -> i32 {
+    let _publish_lock = if opts.publish {
+        match publish_lock::PublishLock::acquire(&opts.log) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("agentbus: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
     // Say where this observer publishes, so readers need not hardcode it. Only
     // when actually publishing: a --no-publish run maintains none of these
     // files and must not point readers at them.
@@ -238,6 +298,32 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     }
     let mut tails = tail::MultiTail::default();
     let mut streams: BTreeMap<PathBuf, Stream> = BTreeMap::new();
+    let mut completions = completion::Index::load(&opts.completions);
+    let cursor_path = state_dir().join("cursors.json");
+    let mut saved_cursors = cursor::load(&cursor_path);
+    // Seed files that predate the checkpoint feature at their current end. If
+    // one later wakes up, it is primed through that prefix to rebuild parser
+    // state without publishing historical bytes. The recency-limited active
+    // set below is still replayed normally to construct the startup snapshot.
+    for found in discover::active(Duration::MAX) {
+        if saved_cursors.contains_key(&found.path) {
+            continue;
+        }
+        let offset = std::fs::metadata(&found.path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if let Some(saved) = cursor::SavedCursor::capture(
+            &found.path,
+            tail::TailCheckpoint {
+                offset,
+                partial: String::new(),
+            },
+        ) {
+            saved_cursors.insert(found.path, saved);
+        }
+    }
+    cursor::prune(&mut saved_cursors);
+    let mut cursors_published = String::new();
     // The first pass replays history; transitions in it are dated from the
     // records themselves, never from the clock.
     let mut snap = Snapshot {
@@ -265,6 +351,16 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
     let mut last_target = PathBuf::new();
 
     loop {
+        let drained_hooks =
+            opts.publish && hook::drain_to_journals(&opts.spool, &opts.register, &opts.inbox);
+        let pruned_spool = if opts.publish {
+            hook::prune_spool(&opts.spool, completion::now_epoch())
+        } else {
+            0
+        };
+        if pruned_spool > 0 {
+            eprintln!("agentbus: pruned {pruned_spool} expired hook spool record(s)");
+        }
         // Rediscovery each tick is what makes new sessions appear without
         // restarting; the recency filter keeps it to a handful of files.
         let found = discover::active(opts.within);
@@ -274,12 +370,28 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             if tails.is_tracked(&f.path) {
                 continue;
             }
+            if !first {
+                if let Some(saved) = saved_cursors
+                    .get(&f.path)
+                    .filter(|saved| saved.matches(&f.path))
+                {
+                    let mut stream = new_stream(f);
+                    prime_stream(&mut stream, saved.tail.offset);
+                    tails.restore(&f.path, saved.tail.clone());
+                    streams.insert(f.path.clone(), stream);
+                    continue;
+                }
+            }
             tails.track(&f.path, from_start);
             streams.insert(f.path.clone(), new_stream(f));
         }
         live.push(opts.inbox.clone());
-        tails.drop_untracked(&live);
-        streams.retain(|p, _| live.contains(p));
+        // Inactivity controls polling, not cursor ownership. Dropping a cursor
+        // here made a transcript that became active again replay from byte zero
+        // and republish its entire history. Keep the lightweight cursor and
+        // normalizer state until the source file genuinely disappears.
+        tails.drop_missing();
+        streams.retain(|p, _| p.exists());
 
         // The inbox is tailed like a transcript: agents that cannot be read off
         // disk publish here, and so do reports no transcript carries.
@@ -296,21 +408,9 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
                 for e in events_for(st, &v) {
                     // Identity is restated on every assistant line. Republishing
                     // unchanged cwd/model would make the log mostly noise, and a
-                    // log worth tailing is the point of an append-only bus.
-                    if let event::Kind::Session {
-                        cwd, model, title, ..
-                    } = &e.kind
-                    {
-                        let fingerprint = format!(
-                            "{}|{}|{}",
-                            cwd.clone().unwrap_or_default(),
-                            model.clone().unwrap_or_default(),
-                            title.clone().unwrap_or_default()
-                        );
-                        if st.last_identity.as_deref() == Some(fingerprint.as_str()) {
-                            continue;
-                        }
-                        st.last_identity = Some(fingerprint);
+                    // log worth tailing is the point of an event bus.
+                    if !remember_identity(st, &e) {
+                        continue;
                     }
                     batch.push(e);
                 }
@@ -334,6 +434,16 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 batch.extend(inbox_events(&v, &mut inbox_panes));
             }
+        }
+
+        // Hooks no longer write these journals directly, so the observer can
+        // compact them after consuming the current inbox cursor without racing
+        // an already-open append descriptor.
+        if opts.publish && (first || drained_hooks) {
+            if hook::compact_inbox(&opts.inbox, completion::now_epoch()) {
+                tails.reset_to_end(&opts.inbox);
+            }
+            let _ = register::compact(&opts.register, 10_000);
         }
 
         for e in &batch {
@@ -410,7 +520,22 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
 
         // `first` is the backfill pass: real history, but not news.
         if opts.publish && !batch.is_empty() && !first {
-            append_log(&opts.log, &batch);
+            if completions.push_events(&batch, completion::now_epoch())
+                && !completions.write_atomic(&opts.completions)
+            {
+                eprintln!(
+                    "agentbus: cannot publish completion index {}",
+                    opts.completions.display()
+                );
+            }
+            if let Err(error) = event_log::append(
+                &opts.log,
+                &batch,
+                opts.event_log_limits,
+                completion::now_epoch(),
+            ) {
+                eprintln!("agentbus: {error}");
+            }
         }
         // Publish on any observable difference, not on "did events arrive".
         // Expiry and a registration going stale both change what is true while
@@ -435,6 +560,26 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
         first = false;
         snap.backfilling = false;
 
+        // A --no-publish observer must not advance the live publishers
+        // publication cursor: doing so would make the next restart skip events
+        // this process printed but never put on the bus.
+        if opts.publish {
+            for (path, checkpoint) in tails.checkpoints() {
+                if !streams.contains_key(&path) {
+                    continue;
+                }
+                if let Some(saved) = cursor::SavedCursor::capture(&path, checkpoint) {
+                    saved_cursors.insert(path, saved);
+                }
+            }
+            cursor::prune(&mut saved_cursors);
+            let cursor_text = cursor::encode(&saved_cursors);
+            if cursor_text != cursors_published && cursor::write_atomic(&cursor_path, &cursor_text)
+            {
+                cursors_published = cursor_text;
+            }
+        }
+
         if !follow {
             break;
         }
@@ -447,6 +592,60 @@ fn run(opts: &Opts, follow: bool, print_snapshot: bool) {
             serde_json::to_string_pretty(&snap.to_json()).unwrap_or_default()
         );
     }
+    0
+}
+
+/// Rebuild source-specific parser state through a previously published prefix.
+/// Events produced here are intentionally discarded: the saved cursor proves
+/// that prefix is history, while parsing it is necessary for facts such as the
+/// last Claude assistant answer carried into a later turn-end record.
+fn prime_stream(stream: &mut Stream, offset: u64) {
+    let Ok(file) = std::fs::File::open(&stream.path) else {
+        return;
+    };
+    let mut reader = BufReader::new(file.take(offset));
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_line(&mut line) else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        // A saved partial line is held by MultiTail and completed by the next
+        // append. Feeding it to a JSON parser here would either do nothing or
+        // reconstruct the wrong source state.
+        if !line.ends_with('\n') {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim_end()) else {
+            continue;
+        };
+        for event in events_for(stream, &value) {
+            remember_identity(stream, &event);
+        }
+    }
+}
+
+fn remember_identity(stream: &mut Stream, event: &Event) -> bool {
+    let Kind::Session {
+        cwd, model, title, ..
+    } = &event.kind
+    else {
+        return true;
+    };
+    let fingerprint = format!(
+        "{}|{}|{}",
+        cwd.clone().unwrap_or_default(),
+        model.clone().unwrap_or_default(),
+        title.clone().unwrap_or_default()
+    );
+    if stream.last_identity.as_deref() == Some(fingerprint.as_str()) {
+        return false;
+    }
+    stream.last_identity = Some(fingerprint);
+    true
 }
 
 fn new_stream(f: &discover::Found) -> Stream {
@@ -529,37 +728,6 @@ fn events_for(st: &mut Stream, v: &serde_json::Value) -> Vec<Event> {
         // from the path is not a fallback here but the only source.
         Source::Agy => agy::normalize(v, &st.fallback),
     }
-}
-
-/// Append a batch as a single write.
-///
-/// `writeln!` on a `File` is unbuffered and issues a syscall per format
-/// fragment, so an event's text and its newline reach the file separately. With
-/// one observer that is merely wasteful; with two — which happens by accident, a
-/// stray `agentbus watch` left running beside the service — the fragments
-/// interleave and the log grows lines that are half an event, or just `}`.
-/// Nothing reports an error, because nothing was reading it closely enough to
-/// notice. `agentbus wait` now does.
-///
-/// Building the batch and issuing one `write` makes the append atomic under
-/// O_APPEND, so a second writer can at worst interleave whole batches.
-fn append_log(path: &std::path::Path, batch: &[Event]) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
-        return;
-    };
-    let mut buf = String::new();
-    for e in batch {
-        buf.push_str(&e.to_json().to_string());
-        buf.push('\n');
-    }
-    let _ = f.write_all(buf.as_bytes());
 }
 
 /// Written via a temp file and renamed, so a subscriber polling the path never
@@ -767,6 +935,49 @@ fn name_subagents(
         }
         for id in drop_ids {
             st.subagents.remove(&id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn priming_restores_the_claude_answer_without_republishing_it() {
+        let dir = std::env::temp_dir().join(format!("agentbus-prime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let assistant = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "session",
+            "timestamp": "2026-08-09T12:00:00Z",
+            "message": { "content": [{ "type": "text", "text": "the full answer" }] }
+        });
+        std::fs::write(&path, format!("{assistant}\n")).unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let found = discover::Found {
+            path: path.clone(),
+            source: Source::Claude,
+            parent_session: None,
+        };
+        let mut stream = new_stream(&found);
+        prime_stream(&mut stream, offset);
+
+        let end = serde_json::json!({
+            "type": "system",
+            "subtype": "turn_duration",
+            "sessionId": "session",
+            "timestamp": "2026-08-09T12:00:01Z",
+            "durationMs": 1000
+        });
+        let events = events_for(&mut stream, &end);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            Kind::TurnEnd { result_full, .. } => {
+                assert_eq!(result_full.as_deref(), Some("the full answer"));
+            }
+            other => panic!("expected turn_end, got {other:?}"),
         }
     }
 }

@@ -78,6 +78,10 @@ state:
     @jq . "${XDG_STATE_HOME:-$HOME/.local/state}/agentbus/snapshot.json" 2>/dev/null \
         || echo "no snapshot; is the observer running?"
 
+# Open the system-wide interactive roster.
+ui *ARGS:
+    cargo run --release -- ui {{ ARGS }}
+
 # Lint, warnings as errors.
 check:
     cargo clippy --all-targets -- -D warnings

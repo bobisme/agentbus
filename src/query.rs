@@ -44,6 +44,7 @@ pub struct Locations {
     pub snapshot: PathBuf,
     pub log: PathBuf,
     pub register: PathBuf,
+    pub completions: PathBuf,
 }
 
 pub fn publisher_path(state_dir: &Path) -> PathBuf {
@@ -61,6 +62,7 @@ pub fn publish_locations(state_dir: &Path, loc: &Locations) {
         "snapshot": loc.snapshot.to_string_lossy(),
         "log": loc.log.to_string_lossy(),
         "register": loc.register.to_string_lossy(),
+        "completions": loc.completions.to_string_lossy(),
         "pid": std::process::id(),
     });
     let path = publisher_path(state_dir);
@@ -101,6 +103,9 @@ pub fn resolve(state_dir: &Path, pinned: &Locations, pinned_snapshot: bool) -> L
         if let Some(p) = get("register") {
             out.register = p;
         }
+        if let Some(p) = get("completions") {
+            out.completions = p;
+        }
     }
     out
 }
@@ -113,7 +118,62 @@ pub struct Session {
     /// The snapshot's object for this session, passed through whole.
     pub state: Value,
     pub pid: u64,
+    /// Nonzero only with `pid`, after exact pid/start-time verification.
+    pub starttime: u64,
     pub transcript: String,
+}
+
+/// How confidently this record describes a process that exists right now.
+///
+/// Transcript discovery deliberately retains recent history, and hook reports
+/// can outlive the process that emitted them. Neither is evidence of liveness.
+/// Only a registration whose pid *and start time* still match is exact enough
+/// to call live; everything else remains queryable but is explicitly marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Verified,
+    Unverified,
+}
+
+impl Presence {
+    pub fn label(self) -> &'static str {
+        match self {
+            Presence::Verified => "verified",
+            Presence::Unverified => "unverified",
+        }
+    }
+}
+
+impl Session {
+    pub fn presence(&self) -> Presence {
+        if self.pid > 0 && self.starttime > 0 {
+            Presence::Verified
+        } else {
+            Presence::Unverified
+        }
+    }
+
+    pub fn text(&self, key: &str) -> &str {
+        self.state.get(key).and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    pub fn number(&self, key: &str) -> u64 {
+        self.state.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+    }
+
+    pub fn pointer_text(&self, pointer: &str) -> &str {
+        self.state
+            .pointer(pointer)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn pointer_number(&self, pointer: &str) -> u64 {
+        self.state
+            .pointer(pointer)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    }
 }
 
 /// Read the published snapshot. `None` means there is none to read — the
@@ -138,16 +198,15 @@ pub fn all(loc: &Locations) -> Option<Vec<Session>> {
                     .unwrap_or_default()
                     .to_string();
                 let reg = regs.get(&id);
+                let live = reg.map(register::exactly_live).unwrap_or(false);
                 Session {
                     id,
                     state: s.clone(),
                     // A registration whose process is gone says nothing useful
                     // about a pid, and reporting one that has been recycled into
                     // an unrelated program is worse than reporting none.
-                    pid: reg
-                        .filter(|p| register::still_true(p))
-                        .map(|p| p.pid)
-                        .unwrap_or(0),
+                    pid: reg.filter(|_| live).map(|p| p.pid).unwrap_or(0),
+                    starttime: reg.filter(|_| live).map(|p| p.starttime).unwrap_or(0),
                     transcript: reg.map(|p| p.transcript.clone()).unwrap_or_default(),
                 }
             })
@@ -424,5 +483,20 @@ mod tests {
         assert!(same_dir("/home/x", "/home/x/"));
         assert!(!same_dir("/home/x", "/home/y"));
         assert!(!same_dir("", "/home/x"));
+    }
+
+    #[test]
+    fn only_a_live_registration_is_verified() {
+        let mut s = Session {
+            id: "s".into(),
+            state: json!({}),
+            pid: 0,
+            starttime: 0,
+            transcript: String::new(),
+        };
+        assert_eq!(s.presence(), Presence::Unverified);
+        s.pid = 42;
+        s.starttime = 7;
+        assert_eq!(s.presence(), Presence::Verified);
     }
 }
