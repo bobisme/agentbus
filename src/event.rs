@@ -530,29 +530,76 @@ fn set_state(s: &mut SessionState, to: &str, at: Option<u64>) {
 /// unresponsive rather than the schema looking wrong.
 pub const SNAPSHOT_VERSION: u64 = 2;
 
-/// Parse `2026-07-31T00:26:12.774Z` to epoch seconds, ignoring the fraction.
+/// Parse `2026-07-31T00:26:12.774Z` to epoch seconds, ignoring everything
+/// after byte 19 (the fraction and the zone designator).
 ///
 /// Hand-rolled because this is the only date handling in the project and it is
 /// always this one shape; a dependency for it would cost more than it saves.
+///
+/// The first 19 bytes are validated strictly: ASCII digits only (no sign, no
+/// whitespace, which `str::parse` would let through), separators `-`, `-`, `T`,
+/// `:`, `:` at bytes 4, 7, 10, 13, 16, month 1-12, a day that exists in that
+/// month (Gregorian leap years), hour < 24, minute < 60, second < 60. A leap
+/// second (`:60`) is rejected on purpose: Unix time has no representation for
+/// it, so accepting it would map it onto the following `:00` and make two
+/// distinct timestamps compare equal. Dates before 1970 are also `None`.
+///
+/// Proved by the Kani harnesses at the bottom of this file (`just kani`).
 pub fn iso_to_epoch(ts: &str) -> Option<u64> {
     let b = ts.as_bytes();
-    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
-    let n = |a: usize, z: usize| ts.get(a..z)?.parse::<i64>().ok();
+    // Fixed-width ASCII digits by hand: `str::parse::<i64>` accepts a leading
+    // `+` or `-`, which would let `+026` pass as a year.
+    let n = |a: usize, z: usize| -> Option<u32> {
+        let mut v = 0u32;
+        for &c in &b[a..z] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + u32::from(c - b'0');
+        }
+        Some(v)
+    };
     let (y, mo, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
     let (h, mi, sec) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
-    // Days from civil, Howard Hinnant's algorithm: correct for any proleptic
-    // Gregorian date, and short enough to read.
-    let y = if mo <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days_in_month = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if d < 1 || d > days_in_month || h > 23 || mi > 59 || sec > 59 {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+    let secs = i64::from(days) * 86400 + i64::from(h * 3600 + mi * 60 + sec);
+    u64::try_from(secs).ok()
+}
+
+/// Days since 1970-01-01 for a valid proleptic Gregorian date with year
+/// 0..=9999. Howard Hinnant's days-from-civil algorithm, correct for any such
+/// date and short enough to read. Shifted forward one 400-year era so every
+/// term is unsigned (Hinnant's original branches on a negative year); the
+/// shift is subtracted again at the end. This also keeps it tractable for
+/// Kani, which did not finish on the signed 64-bit form.
+fn days_from_civil(y: u32, mo: u32, d: u32) -> i32 {
+    let y = if mo <= 2 { y + 399 } else { y + 400 };
+    let (era, yoe) = (y / 400, y % 400);
     let mp = (mo + 9) % 12;
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    let secs = days * 86400 + h * 3600 + mi * 60 + sec;
-    u64::try_from(secs).ok()
+    // At most 2.9 million in magnitude for year <= 9999, so it fits i32.
+    (era * 146097 + doe) as i32 - 719468 - 146097
 }
 
 fn now_secs() -> u64 {
@@ -599,5 +646,224 @@ mod tests {
         assert_eq!(iso_to_epoch(""), None);
         assert_eq!(iso_to_epoch("not a date"), None);
         assert_eq!(iso_to_epoch("2026-07-31"), None);
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_malformed_fields() {
+        assert_eq!(iso_to_epoch("2026-13-01T00:00:00Z"), None); // month 13
+        assert_eq!(iso_to_epoch("2026-00-10T00:00:00Z"), None); // month 0
+        assert_eq!(iso_to_epoch("2026-07-32T00:00:00Z"), None); // day 32
+        assert_eq!(iso_to_epoch("2026-07-00T00:00:00Z"), None); // day 0
+        assert_eq!(iso_to_epoch("2026-04-31T00:00:00Z"), None); // April has 30
+        assert_eq!(iso_to_epoch("2026-07-31T24:00:00Z"), None); // hour 24
+        assert_eq!(iso_to_epoch("2026-07-31T00:60:00Z"), None); // minute 60
+        assert_eq!(iso_to_epoch("2026-07-31T00:00:60Z"), None); // leap second
+        assert_eq!(iso_to_epoch("2025-02-29T00:00:00Z"), None); // not a leap year
+        assert_eq!(iso_to_epoch("2100-02-29T00:00:00Z"), None); // century, not leap
+        assert_eq!(iso_to_epoch("+026-07-31T00:00:00Z"), None); // sign in year
+        assert_eq!(iso_to_epoch("2026-+7-31T00:00:00Z"), None);
+        assert_eq!(iso_to_epoch("2026-07-31T 0:00:00Z"), None); // whitespace
+        assert_eq!(iso_to_epoch("2026-07-31T00-00:00Z"), None); // missing ':'
+        assert_eq!(iso_to_epoch("2026-07-31T00:00-00Z"), None); // missing ':'
+        assert_eq!(iso_to_epoch("2026-07-31T00:00:0éZ"), None); // non-ASCII
+    }
+
+    #[test]
+    fn accepts_leap_days() {
+        assert_eq!(iso_to_epoch("2000-02-29T00:00:00Z"), Some(951782400));
+        assert_eq!(iso_to_epoch("2024-02-29T23:59:59Z"), Some(1709251199));
+    }
+}
+
+// Kani proofs. `iso_to_epoch` takes a fixed 19-byte prefix, so these cover
+// every input completely (the only loops are the 2-4 digit scans).
+#[cfg(kani)]
+mod kani_proofs {
+    use super::iso_to_epoch;
+
+    fn digit(b: u8) -> u32 {
+        u32::from(b - b'0')
+    }
+
+    /// View arbitrary bytes as a `&str` without UTF-8 validation. `from_utf8`
+    /// makes CBMC intractable (validation of 24 symbolic bytes did not finish
+    /// in 8 minutes). This is sound here because `iso_to_epoch` only ever calls
+    /// `str::as_bytes` and never a char-based `str` API, so it cannot observe
+    /// invalid UTF-8; the inputs cover a strict superset of valid strings.
+    fn as_str(bytes: &[u8]) -> &str {
+        // SAFETY: see above; the result is only used through `as_bytes`.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
+
+    fn field(b: &[u8], a: usize, z: usize) -> u32 {
+        b[a..z].iter().fold(0, |v, &c| v * 10 + digit(c))
+    }
+
+    /// Any byte string of 19..=24 bytes (a superset of the valid UTF-8 ones): never panics.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn iso_to_epoch_never_panics() {
+        let bytes: [u8; 24] = kani::any();
+        let len: usize = kani::any();
+        kani::assume((19..=24).contains(&len));
+        let _ = iso_to_epoch(as_str(&bytes[..len]));
+    }
+
+    /// `Some(_)` implies every field of the 19-byte prefix is well-formed.
+    /// Second 60 is excluded deliberately (see the function docs).
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn iso_to_epoch_some_implies_well_formed() {
+        let bytes: [u8; 24] = kani::any();
+        let len: usize = kani::any();
+        kani::assume((19..=24).contains(&len));
+        if iso_to_epoch(as_str(&bytes[..len])).is_some() {
+            let b = &bytes[..19];
+            for (i, &c) in b.iter().enumerate() {
+                if matches!(i, 4 | 7 | 10 | 13 | 16) {
+                    let want = if i == 10 {
+                        b'T'
+                    } else if i < 10 {
+                        b'-'
+                    } else {
+                        b':'
+                    };
+                    assert!(c == want);
+                } else {
+                    assert!(c.is_ascii_digit()); // no sign, no whitespace
+                }
+            }
+            let (y, mo, d) = (field(b, 0, 4), field(b, 5, 7), field(b, 8, 10));
+            let (h, mi, sec) = (field(b, 11, 13), field(b, 14, 16), field(b, 17, 19));
+            assert!((1..=12).contains(&mo));
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            let dim = match mo {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                _ if leap => 29,
+                _ => 28,
+            };
+            assert!(d >= 1 && d <= dim);
+            assert!(h < 24 && mi < 60 && sec < 60);
+        }
+    }
+
+    fn days_in_month(y: u32, mo: u32) -> u32 {
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        match mo {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ if leap => 29,
+            _ => 28,
+        }
+    }
+
+    fn render([y, mo, d, h, mi, sec]: [u32; 6]) -> [u8; 19] {
+        let dg = |v: u32, div: u32| b'0' + ((v / div) % 10) as u8;
+        [
+            dg(y, 1000),
+            dg(y, 100),
+            dg(y, 10),
+            dg(y, 1),
+            b'-',
+            dg(mo, 10),
+            dg(mo, 1),
+            b'-',
+            dg(d, 10),
+            dg(d, 1),
+            b'T',
+            dg(h, 10),
+            dg(h, 1),
+            b':',
+            dg(mi, 10),
+            dg(mi, 1),
+            b':',
+            dg(sec, 10),
+            dg(sec, 1),
+        ]
+    }
+
+    /// The converse of harness 2, so over-rejection is caught too: every
+    /// well-formed timestamp from 1970 on is accepted.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn well_formed_is_accepted() {
+        let [y, mo, d, h, mi, sec]: [u32; 6] = [(); 6].map(|_| kani::any());
+        kani::assume((1970..=9999).contains(&y) && (1..=12).contains(&mo));
+        kani::assume((1..=days_in_month(y, mo)).contains(&d) && h < 24 && mi < 60 && sec < 60);
+        assert!(iso_to_epoch(as_str(&render([y, mo, d, h, mi, sec]))).is_some());
+    }
+
+    /// Ordering, proved by decomposition. Checking two symbolic timestamps
+    /// directly (`a < b` iff `epoch(a) < epoch(b)`) did not finish in ten
+    /// minutes: it needs CBMC to relate two copies of the days-from-civil
+    /// arithmetic. The property is split into three cheaper facts about the
+    /// real code, and the composition is on paper below.
+    ///
+    /// Let t range over well-formed timestamps from 1970-01-01T00:00:00 to
+    /// 9999-12-31T23:59:59, and `next(t)` be the calendar second after t.
+    ///   (A) `days_successor`: days(next date) == days(date) + 1.
+    ///   (B) `epoch_is_days_plus_time_of_day`: epoch(t) == days*86400 + tod.
+    ///   (C) `successor_bytes_are_greater`: bytes(t) < bytes(next(t)).
+    /// From (A) and (B): within a day epoch(next) = epoch + 1 (tod + 1); across
+    /// midnight epoch(next) = (days+1)*86400 + 0 = days*86400 + 86399 + 1 =
+    /// epoch + 1. So epoch(next(t)) == epoch(t) + 1 always. The timestamps form
+    /// one chain under `next`, and by (C) with fixed-width digits (which order
+    /// as their fields do) byte order is chain order. For a < b bytewise, b is
+    /// k >= 1 steps after a, so epoch(b) = epoch(a) + k > epoch(a); symmetric
+    /// for a > b; a == b gives equal epochs. Byte order is total, so the three
+    /// cases are exhaustive and `==` and `<` are both iff. Timestamps before
+    /// 1970 are `None` by design and out of scope.
+    fn next_date(y: u32, mo: u32, d: u32) -> (u32, u32, u32) {
+        if d < days_in_month(y, mo) {
+            (y, mo, d + 1)
+        } else if mo < 12 {
+            (y, mo + 1, 1)
+        } else {
+            (y + 1, 1, 1)
+        }
+    }
+
+    #[kani::proof]
+    fn days_successor() {
+        let (y, mo, d): (u32, u32, u32) = (kani::any(), kani::any(), kani::any());
+        kani::assume((1970..=9999).contains(&y) && (1..=12).contains(&mo));
+        kani::assume((1..=days_in_month(y, mo)).contains(&d));
+        // The last day's successor is year 10000, outside days_from_civil's domain.
+        kani::assume(!(y == 9999 && mo == 12 && d == 31));
+        let (y2, mo2, d2) = next_date(y, mo, d);
+        assert!(super::days_from_civil(y2, mo2, d2) == super::days_from_civil(y, mo, d) + 1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn epoch_is_days_plus_time_of_day() {
+        let [y, mo, d, h, mi, sec]: [u32; 6] = [(); 6].map(|_| kani::any());
+        kani::assume((1970..=9999).contains(&y) && (1..=12).contains(&mo));
+        kani::assume((1..=days_in_month(y, mo)).contains(&d) && h < 24 && mi < 60 && sec < 60);
+        let t = render([y, mo, d, h, mi, sec]);
+        let want = i64::from(super::days_from_civil(y, mo, d)) * 86400
+            + i64::from(h * 3600 + mi * 60 + sec);
+        assert!(iso_to_epoch(as_str(&t)) == Some(want as u64));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn successor_bytes_are_greater() {
+        let [y, mo, d, h, mi, sec]: [u32; 6] = [(); 6].map(|_| kani::any());
+        kani::assume((1970..=9999).contains(&y) && (1..=12).contains(&mo));
+        kani::assume((1..=days_in_month(y, mo)).contains(&d) && h < 24 && mi < 60 && sec < 60);
+        kani::assume(!(y == 9999 && mo == 12 && d == 31 && h == 23 && mi == 59 && sec == 59));
+        let next = if sec < 59 {
+            [y, mo, d, h, mi, sec + 1]
+        } else if mi < 59 {
+            [y, mo, d, h, mi + 1, 0]
+        } else if h < 23 {
+            [y, mo, d, h + 1, 0, 0]
+        } else {
+            let (y2, mo2, d2) = next_date(y, mo, d);
+            [y2, mo2, d2, 0, 0, 0]
+        };
+        assert!(render([y, mo, d, h, mi, sec]) < render(next));
     }
 }

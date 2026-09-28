@@ -89,3 +89,7 @@ check:
 # Format.
 fmt:
     cargo fmt
+
+# Prove properties of small pure functions (needs `cargo install --locked kani-verifier`).
+kani:
+    cargo kani

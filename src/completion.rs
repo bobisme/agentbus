@@ -298,9 +298,15 @@ pub fn now_epoch() -> u64 {
 mod tests {
     use super::*;
 
+    /// Seconds past 12:00:00, carried into the minutes: iso_to_epoch rejects
+    /// a seconds field of 60 or more.
+    fn stamp(second: u64) -> String {
+        format!("2026-08-09T12:{:02}:{:02}Z", second / 60, second % 60)
+    }
+
     fn completion(session: &str, second: u64) -> Event {
         Event {
-            ts: format!("2026-08-09T12:00:{second:02}Z"),
+            ts: stamp(second),
             source: "test",
             session: session.into(),
             kind: Kind::TurnEnd {
@@ -428,7 +434,7 @@ mod tests {
     }
 
     fn at(second: u64) -> u64 {
-        event::iso_to_epoch(&format!("2026-08-09T12:00:{second:02}Z")).unwrap()
+        event::iso_to_epoch(&stamp(second)).unwrap()
     }
 
     fn unbounded() -> Limits {
