@@ -427,6 +427,132 @@ mod tests {
         assert!(matches!(loaded.first_after("a", 0), Lookup::Found(_)));
     }
 
+    fn at(second: u64) -> u64 {
+        event::iso_to_epoch(&format!("2026-08-09T12:00:{second:02}Z")).unwrap()
+    }
+
+    fn unbounded() -> Limits {
+        Limits {
+            max_age_secs: u64::MAX,
+            max_records: usize::MAX,
+            max_bytes: usize::MAX,
+        }
+    }
+
+    /// bn-351. A record exactly `max_age_secs` old is retained; one second
+    /// older is pruned.
+    #[test]
+    fn age_cutoff_keeps_a_record_exactly_max_age_old() {
+        let limits = Limits {
+            max_age_secs: 20,
+            ..unbounded()
+        };
+        let mut index = Index::with_limits(limits);
+        index.push_events(&[completion("a", 10)], at(30));
+        assert_eq!(index.records.len(), 1);
+        assert_eq!(index.floor, 1);
+
+        let mut index = Index::with_limits(limits);
+        index.push_events(&[completion("a", 10)], at(31));
+        assert!(index.records.is_empty());
+        assert_eq!((index.floor, index.pruned_epoch), (2, Some(at(10))));
+    }
+
+    /// Records are ordered by generation, not time, so age pruning stops at
+    /// the first record that is young enough, even with an older one behind.
+    #[test]
+    fn age_pruning_stops_at_a_young_front_record() {
+        let mut index = Index::with_limits(Limits {
+            max_age_secs: 20,
+            ..unbounded()
+        });
+        index.push_events(&[completion("a", 50), completion("b", 10)], at(60));
+        assert_eq!(index.records.len(), 2);
+        assert_eq!((index.floor, index.pruned_epoch), (1, None));
+        // Once the front expires the old record behind it goes too.
+        index.push_events(&[completion("c", 55)], at(71));
+        assert_eq!(index.records.len(), 1);
+        assert_eq!(index.floor, 3);
+    }
+
+    #[test]
+    fn record_cap_keeps_exactly_max_records() {
+        let mut index = Index::with_limits(Limits {
+            max_records: 3,
+            ..unbounded()
+        });
+        index.push_events(&[completion("a", 1), completion("a", 2)], at(30));
+        assert_eq!(index.records.len(), 2);
+        index.push_events(&[completion("a", 3)], at(30));
+        assert_eq!((index.records.len(), index.floor), (3, 1));
+        index.push_events(&[completion("a", 4)], at(30));
+        assert_eq!((index.records.len(), index.floor), (3, 2));
+    }
+
+    /// Three records of equal shape, with the encoded length of the index at
+    /// each of 3, 2 and 1 retained records.
+    fn sized_index() -> (Index, [usize; 3]) {
+        let mut index = Index::with_limits(unbounded());
+        index.push_events(
+            &[completion("a", 1), completion("a", 2), completion("a", 3)],
+            at(30),
+        );
+        let mut probe = index.clone();
+        let full = probe.encode().len();
+        probe.remove_oldest();
+        let two = probe.encode().len();
+        probe.remove_oldest();
+        let one = probe.encode().len();
+        assert!(one < two && two < full);
+        (index, [full, two, one])
+    }
+
+    fn pruned_to(max_bytes: usize) -> Index {
+        let (mut index, _) = sized_index();
+        index.limits.max_bytes = max_bytes;
+        index.prune(at(30));
+        index
+    }
+
+    #[test]
+    fn byte_cap_keeps_an_index_exactly_at_the_limit() {
+        let (_, [full, two, one]) = sized_index();
+        for (max_bytes, kept) in [(full, 3), (full - 1, 2), (two, 2), (two - 1, 1), (one, 1)] {
+            let index = pruned_to(max_bytes);
+            assert_eq!(index.records.len(), kept, "max_bytes {max_bytes}");
+            if kept > 1 {
+                assert!(index.encode().len() <= max_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn byte_cap_prunes_oldest_first_and_records_the_floor() {
+        let (_, [_, two, _]) = sized_index();
+        let index = pruned_to(two - 1);
+        assert_eq!(index.floor, 3);
+        assert_eq!(index.pruned_epoch, Some(at(2)));
+        assert_eq!(index.records[0]["generation"], json!(3));
+    }
+
+    #[test]
+    fn byte_cap_never_prunes_the_last_record() {
+        let (_, [_, _, one]) = sized_index();
+        for max_bytes in [one - 1, 1, 0] {
+            let index = pruned_to(max_bytes);
+            assert_eq!(index.records.len(), 1, "max_bytes {max_bytes}");
+            assert!(index.encode().len() > max_bytes);
+            assert_eq!(index.records[0]["generation"], json!(3));
+        }
+        // A lone record over the cap survives a push too.
+        let mut index = Index::with_limits(Limits {
+            max_bytes: 0,
+            ..unbounded()
+        });
+        index.push_events(&[completion("a", 1)], at(30));
+        assert_eq!(index.records.len(), 1);
+    }
+
     /// bn-wo6: `Index` checked against an unbounded reference log.
     ///
     /// The contract `wait` rests on. With `r` the first reference record for
@@ -657,6 +783,14 @@ mod tests {
                         if index.records.len() < before + added as usize {
                             seen.pruned.fetch_add(1, Relaxed);
                         }
+                        prop_assert!(index.records.len() <= limits.max_records);
+                        prop_assert!(
+                            index.records.len() == 1 || index.encode().len() <= limits.max_bytes,
+                            "{} records encode to {} bytes over {}",
+                            index.records.len(),
+                            index.encode().len(),
+                            limits.max_bytes
+                        );
                     }
                     Op::RoundTrip => {
                         let mut loaded = Index::decode(&index.encode());
