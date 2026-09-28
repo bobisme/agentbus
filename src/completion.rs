@@ -863,4 +863,61 @@ mod tests {
             }
         }
     }
+
+    fn pushed_result(full: &str) -> Value {
+        let now = event::iso_to_epoch("2026-08-09T12:01:00Z").unwrap();
+        let mut event = completion("a", 1);
+        event.kind = Kind::TurnEnd {
+            duration_ms: Some(1),
+            result: Some("preview".into()),
+            result_full: Some(full.into()),
+        };
+        let mut index = Index::default();
+        index.push_events(&[event], now);
+        index.records.last().cloned().expect("record retained")
+    }
+
+    const TRUNCATION_MARKER: &str = "\n[agentbus: completion truncated]";
+
+    #[test]
+    fn result_limit_is_one_mebibyte() {
+        assert_eq!(MAX_RESULT_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn result_full_over_the_limit_is_cut_and_marked() {
+        let full = "x".repeat(MAX_RESULT_BYTES + 1);
+        let record = pushed_result(&full);
+        let kept = record["result_full"].as_str().unwrap();
+        assert_eq!(
+            kept,
+            format!("{}{TRUNCATION_MARKER}", &full[..MAX_RESULT_BYTES])
+        );
+        assert_eq!(record["result_truncated"], json!(true));
+        // The preview is a separate field the clamp never reads or changes.
+        assert_eq!(record["result"], json!("preview"));
+    }
+
+    #[test]
+    fn result_full_cut_ends_on_the_last_char_boundary_before_the_limit() {
+        // A 3-byte character starting one byte before the limit straddles it.
+        let mut full = "x".repeat(MAX_RESULT_BYTES - 1);
+        full.push('€');
+        full.push_str("tail");
+        assert!(!full.is_char_boundary(MAX_RESULT_BYTES));
+        let record = pushed_result(&full);
+        let kept = record["result_full"].as_str().unwrap();
+        let prefix = kept.strip_suffix(TRUNCATION_MARKER).expect("marker");
+        assert_eq!(prefix.len(), MAX_RESULT_BYTES - 1);
+        assert_eq!(prefix, &full[..MAX_RESULT_BYTES - 1]);
+        assert_eq!(record["result_truncated"], json!(true));
+    }
+
+    #[test]
+    fn result_full_at_the_limit_is_untouched() {
+        let full = "x".repeat(MAX_RESULT_BYTES);
+        let record = pushed_result(&full);
+        assert_eq!(record["result_full"], json!(full));
+        assert!(record.get("result_truncated").is_none());
+    }
 }
