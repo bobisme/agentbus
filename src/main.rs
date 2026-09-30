@@ -61,15 +61,16 @@ USAGE:
 ASKING:
     agentbus sessions [--pid N] [--session S] [--cwd D] [--json]
     agentbus ui [--all]
-    agentbus wait (--session S | --pid N) [--timeout SECS] [--since EPOCH] [--json]
+    agentbus wait (--session S | --pid N) [--timeout SECS] [--since EPOCH[.FRAC]] [--json]
 
     --pid matches the named process or any descendant of it, so a supervisor
     can pass the pid it spawned without knowing that codex runs behind a shim.
 
     wait blocks until the current-or-next turn ends. It never reports a turn
     that ended before it started, so a caller that submits first should mark
-    the moment — `t=$(date +%s)` — and pass --since $t, or a turn that lands
-    in the gap is missed.
+    the moment — `t=$(date +%s.%N)` — and pass --since $t, or a turn that lands
+    in the gap is missed. Keep the fraction: a whole-second mark still admits
+    a previous turn that ended earlier in that second.
 
     wait exits 0 when the turn ended, 3 if the agent is blocked on a prompt,
     4 on timeout, 1 on resolution, observer, or retained-history errors.

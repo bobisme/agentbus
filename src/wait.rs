@@ -61,10 +61,16 @@ const _WATERMARK: () = ();
 /// So `--since <epoch>` is the caller's own reference point: shell `date +%s`
 /// before submitting, pass it here. It costs no file and no bookkeeping, which
 /// is what a caller had to do instead. Without it the behaviour is unchanged.
+///
+/// Fractional seconds are accepted, and needed by a caller that drives one
+/// session turn after turn: it marks the next turn straight after the last
+/// wait returned, often in the second that turn ended, and a whole-second mark
+/// cannot exclude it (bn-m77). `date +%s.%N` can.
 struct Args {
     filter: Filter,
     timeout: Duration,
     json: bool,
+    /// Epoch milliseconds.
     since: Option<u64>,
 }
 
@@ -87,13 +93,31 @@ fn parse(args: &[String]) -> Args {
                     a.timeout = Duration::from_secs(v);
                 }
             }
-            "--since" => a.since = next.and_then(|v| v.parse().ok()),
+            "--since" => a.since = next.and_then(|v| since_ms(v)),
             "--json" => a.json = true,
             _ => {}
         }
         i += 1;
     }
     a
+}
+
+/// Epoch seconds, whole or fractional, as epoch milliseconds. Digits past the
+/// millisecond are dropped, which moves the mark earlier and so can admit a
+/// turn that ended in that same millisecond but never miss one.
+fn since_ms(v: &str) -> Option<u64> {
+    let (whole, fraction) = v.split_once('.').unwrap_or((v, ""));
+    let digits = |t: &str| t.bytes().all(|c| c.is_ascii_digit());
+    if whole.is_empty() || !digits(whole) || !digits(fraction) {
+        return None;
+    }
+    let mut ms = whole.parse::<u64>().ok()?.checked_mul(1000)?;
+    let mut unit = 100;
+    for c in fraction.bytes().take(3) {
+        ms += u64::from(c - b'0') * unit;
+        unit /= 10;
+    }
+    Some(ms)
 }
 
 /// Pull the answer off a turn_end record, full text first.
@@ -647,12 +671,61 @@ mod tests {
         assert_eq!(a.filter.cwd.as_deref(), Some("/work"));
         assert_eq!(a.filter.session.as_deref(), Some("abc"));
         assert_eq!(a.timeout, Duration::from_secs(5));
-        assert_eq!(a.since, Some(123));
+        assert_eq!(a.since, Some(123_000));
         assert!(a.json);
         let none = parse(&[]);
         assert!(none.filter.is_empty());
         assert_eq!(none.timeout, DEFAULT_TIMEOUT);
         assert!(!none.json && none.since.is_none());
+    }
+
+    #[test]
+    fn since_reads_whole_and_fractional_seconds_as_milliseconds() {
+        assert_eq!(since_ms("123"), Some(123_000));
+        assert_eq!(since_ms("123."), Some(123_000));
+        assert_eq!(since_ms("123.4"), Some(123_400));
+        assert_eq!(since_ms("123.45"), Some(123_450));
+        assert_eq!(since_ms("123.456"), Some(123_456));
+        // `date +%s.%N`: nanoseconds, cut to the millisecond, never rounded up.
+        assert_eq!(since_ms("1790808154.999999999"), Some(1_790_808_154_999));
+        for bad in ["", ".5", "-1", "+1", "1e3", "12.3.4", "12.-3", " 1", "x"] {
+            assert_eq!(since_ms(bad), None, "{bad:?}");
+        }
+        assert_eq!(since_ms(&u64::MAX.to_string()), None);
+    }
+
+    /// bn-m77, end to end. The previous turn ended at 12:00:00.250 and the
+    /// caller marked the next one later in that same second: the finished
+    /// turn is not this one's answer, so the wait runs on to its timeout.
+    #[test]
+    fn a_fractional_since_excludes_a_turn_that_ended_earlier_in_its_second() {
+        let loc = fixture("since-same-second");
+        let second = crate::event::iso_to_epoch("2026-08-09T12:00:00Z").unwrap();
+        let mut index = Index::default();
+        index.push_events(
+            &[Event {
+                ts: "2026-08-09T12:00:00.250Z".into(),
+                source: "test",
+                session: "s".into(),
+                kind: Kind::TurnEnd {
+                    duration_ms: Some(7),
+                    result: Some("previous".into()),
+                    result_full: Some("previous".into()),
+                },
+            }],
+            second,
+        );
+        assert!(index.write_atomic(&loc.completions));
+        let wait = |since: String| {
+            run(
+                &args(&["--session", "s", "--since", &since, "--timeout", "0"]),
+                &loc,
+            )
+        };
+        assert_eq!(wait(format!("{second}.600")), TIMEOUT);
+        assert_eq!(wait(format!("{second}.100")), OK);
+        // A whole-second mark still cannot tell, and still admits it.
+        assert_eq!(wait(second.to_string()), OK);
     }
 
     #[test]

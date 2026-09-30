@@ -193,7 +193,7 @@ session, and keep up as both change. Two verbs replace all of it.
 
 ```bash
 agentbus sessions [--pid N] [--session S] [--cwd D] [--json]
-agentbus wait (--session S | --pid N | --cwd D) [--timeout SECS] [--since EPOCH] [--json]
+agentbus wait (--session S | --pid N | --cwd D) [--timeout SECS] [--since EPOCH[.FRAC]] [--json]
 ```
 
 **`--pid` matches the process named or any descendant of it.** agentbus
@@ -218,13 +218,20 @@ state. The
 consequence is that a caller submitting first should mark the moment and say so:
 
 ```bash
-t=$(date +%s)
+t=$(date +%s.%N)
 send_prompt_somehow
 agentbus wait --pid $AGENT_PID --since $t --json
 ```
 
 Without `--since`, a turn that finishes between submitting and calling is behind
 the watermark, and the wait sits there until the *next* one.
+
+Mark with the fraction. `--since` admits any turn that ended at or after it,
+and a caller driving one session turn after turn often marks the next turn in
+the same second the last one ended. At whole seconds (`date +%s`)
+that last turn qualifies again and comes back, instantly, as the answer to the
+prompt just sent. Turn ends are stamped to the millisecond, so a mark as fine
+tells them apart.
 
 A session that has not registered yet is waited for rather than rejected — an
 agent does not appear until its first prompt, so the session a supervisor just

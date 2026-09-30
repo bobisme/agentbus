@@ -163,10 +163,19 @@ impl Index {
             .unwrap_or(Lookup::Pending)
     }
 
-    pub fn newest_since(&self, session: &str, since: u64) -> Lookup {
+    /// The newest completion for `session` that can have ended at or after
+    /// `since_ms`, in epoch milliseconds.
+    ///
+    /// Milliseconds because a supervisor driving one session turn after turn
+    /// marks `since` in the same second the previous turn ended (bn-m77), and
+    /// at whole seconds that turn qualifies again and is returned as the next
+    /// one. Both sources stamp turn ends to the millisecond, so the two are
+    /// told apart as long as the caller's mark is as fine; a whole-second
+    /// mark behaves as it always did.
+    pub fn newest_since(&self, session: &str, since_ms: u64) -> Lookup {
         let found = self.records.iter().rev().find(|record| {
             record.get("session").and_then(Value::as_str) == Some(session)
-                && record_epoch(record).is_some_and(|timestamp| timestamp >= since)
+                && record_latest_ms(record).is_some_and(|latest| latest >= since_ms)
         });
         if let Some(record) = found {
             return Lookup::Found(record.clone());
@@ -174,7 +183,14 @@ impl Index {
         // Not "since is older than the oldest retained record": retention is
         // by generation, so the first retained record need not be the oldest
         // by time, and a discarded answer newer than `since` can sit behind it.
-        if self.pruned_epoch.is_some_and(|pruned| since <= pruned) {
+        //
+        // `pruned_epoch` is whole seconds, so this refuses any `since` inside
+        // the second of the newest discarded answer, even one after it. That
+        // errs toward `Expired`, the answer that can be retried.
+        if self
+            .pruned_epoch
+            .is_some_and(|pruned| since_ms / 1000 <= pruned)
+        {
             Lookup::Expired { floor: self.floor }
         } else {
             Lookup::Pending
@@ -265,6 +281,38 @@ fn record_epoch(record: &Value) -> Option<u64> {
         .and_then(Value::as_str)
         .and_then(event::iso_to_epoch)
         .or_else(|| record.get("retained_at").and_then(Value::as_u64))
+}
+
+/// The latest instant, in epoch milliseconds, at which a record's turn can
+/// have ended. A timestamp to the millisecond or finer is taken as it stands;
+/// a coarser one could mean anywhere in its last unit and is read as the end
+/// of it, so that `newest_since` never skips a turn because its source
+/// rounded. `retained_at` is whole seconds.
+fn record_latest_ms(record: &Value) -> Option<u64> {
+    if let Some(ts) = record.get("ts").and_then(Value::as_str) {
+        if let Some(secs) = event::iso_to_epoch(ts) {
+            // `iso_to_epoch` accepted the first 19 bytes, all ASCII, so this
+            // is a char boundary.
+            return Some(secs * 1000 + latest_ms_of_fraction(&ts[19..]));
+        }
+    }
+    record
+        .get("retained_at")
+        .and_then(Value::as_u64)
+        .map(|secs| secs.saturating_mul(1000).saturating_add(999))
+}
+
+/// Milliseconds into the second, rounded up past what the digits after `.`
+/// leave unsaid: none gives 999, `.1` gives 199, `.123456` gives 123.
+fn latest_ms_of_fraction(rest: &str) -> u64 {
+    let digits = rest.strip_prefix('.').unwrap_or("");
+    let mut ms = 0;
+    let mut unit = 1000;
+    for c in digits.bytes().take_while(u8::is_ascii_digit).take(3) {
+        unit /= 10;
+        ms += u64::from(c - b'0') * unit;
+    }
+    ms + unit - 1
 }
 
 fn clamp_result(record: &mut Value) {
@@ -363,15 +411,71 @@ mod tests {
         });
         index.push_events(&[completion("a", 50), completion("b", 10)], now);
         let since = event::iso_to_epoch("2026-08-09T12:00:30Z").unwrap();
-        assert_eq!(index.newest_since("a", since), Lookup::Expired { floor: 2 });
+        assert_eq!(
+            index.newest_since("a", since * 1000),
+            Lookup::Expired { floor: 2 }
+        );
         let reloaded = Index::decode(&index.encode());
         assert_eq!(
-            reloaded.newest_since("a", since),
+            reloaded.newest_since("a", since * 1000),
             Lookup::Expired { floor: 2 }
         );
         // Newer than anything discarded: still an honest wait.
         let later = event::iso_to_epoch("2026-08-09T12:00:51Z").unwrap();
-        assert_eq!(index.newest_since("a", later), Lookup::Pending);
+        assert_eq!(index.newest_since("a", later * 1000), Lookup::Pending);
+    }
+
+    /// bn-m77. Two turns of one session end in the same second, and the
+    /// caller marks `since` between them, as a supervisor does when it sends
+    /// the next prompt straight after the last wait returned. Only the later
+    /// turn is an answer to it.
+    #[test]
+    fn newest_since_tells_apart_two_turns_in_the_same_second() {
+        let turn = |ts: &str, text: &str| Event {
+            ts: ts.into(),
+            source: "test",
+            session: "a".into(),
+            kind: Kind::TurnEnd {
+                duration_ms: Some(1),
+                result: Some(text.into()),
+                result_full: Some(text.into()),
+            },
+        };
+        let second = event::iso_to_epoch("2026-08-09T12:00:55Z").unwrap() * 1000;
+        let mut index = Index::default();
+        index.push_events(&[turn("2026-08-09T12:00:55.199Z", "three")], second / 1000);
+        let between = second + 400;
+        assert_eq!(index.newest_since("a", between), Lookup::Pending);
+        index.push_events(&[turn("2026-08-09T12:00:55.873Z", "four")], second / 1000);
+        let Lookup::Found(record) = index.newest_since("a", between) else {
+            panic!("the later turn was not found");
+        };
+        assert_eq!(record["result"], json!("four"));
+        // A whole-second mark cannot tell them apart and still admits both,
+        // the newest first.
+        let Lookup::Found(record) = index.newest_since("a", second) else {
+            panic!("a whole-second mark missed the turns in its second");
+        };
+        assert_eq!(record["result"], json!("four"));
+    }
+
+    #[test]
+    fn a_coarse_timestamp_is_read_as_the_end_of_its_last_unit() {
+        assert_eq!(latest_ms_of_fraction("Z"), 999);
+        assert_eq!(latest_ms_of_fraction(""), 999);
+        assert_eq!(latest_ms_of_fraction(".1Z"), 199);
+        assert_eq!(latest_ms_of_fraction(".12Z"), 129);
+        assert_eq!(latest_ms_of_fraction(".123Z"), 123);
+        assert_eq!(latest_ms_of_fraction(".123456789Z"), 123);
+        assert_eq!(latest_ms_of_fraction(".Z"), 999);
+        let at = |ts: &str| record_latest_ms(&json!({ "ts": ts }));
+        let second = event::iso_to_epoch("2026-08-09T12:00:55Z").unwrap() * 1000;
+        assert_eq!(at("2026-08-09T12:00:55Z"), Some(second + 999));
+        assert_eq!(at("2026-08-09T12:00:55.042Z"), Some(second + 42));
+        assert_eq!(
+            record_latest_ms(&json!({ "ts": "", "retained_at": 7 })),
+            Some(7999)
+        );
     }
 
     #[test]
@@ -392,11 +496,11 @@ mod tests {
         };
         assert_eq!(Index::decode(&legacy(2)).pruned_epoch, Some(at(40)));
         assert_eq!(
-            Index::decode(&legacy(2)).newest_since("a", at(30)),
+            Index::decode(&legacy(2)).newest_since("a", at(30) * 1000),
             Lookup::Expired { floor: 2 }
         );
         assert_eq!(
-            Index::decode(&legacy(2)).newest_since("a", at(41)),
+            Index::decode(&legacy(2)).newest_since("a", at(41) * 1000),
             Lookup::Pending
         );
         assert_eq!(Index::decode(&legacy(1)).pruned_epoch, None);
@@ -569,14 +673,16 @@ mod tests {
     /// record other than `r`.
     ///
     /// With `r` the newest (highest-generation, the order turns were
-    /// published in) reference record for `s` with timestamp at or after
-    /// `since`, `newest_since(s, since)` is:
+    /// published in) reference record for `s` that can have ended at or
+    /// after `since` (a whole-second stamp covering its whole second),
+    /// `newest_since(s, since)` is:
     ///   - `Found(r)` if `r` is retained, and nothing else will do;
     ///   - `Expired` if `r` was discarded;
     ///   - with no `r`, `Pending`, or `Expired` provided some discarded record
-    ///     of *any* session has a timestamp at or after `since`. The index
-    ///     keeps one watermark rather than one per session, so it may refuse
-    ///     a wait it could have kept; it must never keep one it should refuse.
+    ///     of *any* session has a timestamp in or after `since`'s second. The
+    ///     index keeps one watermark rather than one per session, and in whole
+    ///     seconds, so it may refuse a wait it could have kept; it must never
+    ///     keep one it should refuse.
     ///
     /// Every `Expired` carries the index's current floor.
     ///
@@ -608,6 +714,8 @@ mod tests {
         #[derive(Clone, Debug)]
         enum Stamp {
             At(u64),
+            /// Milliseconds past 12:00:00, written to the millisecond.
+            AtMs(u64),
             Empty,
             Garbage,
         }
@@ -641,6 +749,7 @@ mod tests {
             generation: u64,
             session: String,
             epoch: u64,
+            latest_ms: u64,
             marker: String,
         }
 
@@ -662,7 +771,8 @@ mod tests {
 
         fn stamp() -> impl Strategy<Value = Stamp> {
             prop_oneof![
-                8 => (0u64..90).prop_map(Stamp::At),
+                5 => (0u64..90).prop_map(Stamp::At),
+                3 => (0u64..90_000).prop_map(Stamp::AtMs),
                 1 => Just(Stamp::Empty),
                 1 => Just(Stamp::Garbage),
             ]
@@ -699,7 +809,14 @@ mod tests {
                     ],
                 )
                     .prop_map(|(session, watermark)| Op::FirstAfter { session, watermark }),
-                3 => (0..SESSIONS.len(), prop_oneof![9 => (0u64..100).prop_map(|s| base() + s), 1 => Just(0u64)])
+                3 => (
+                    0..SESSIONS.len(),
+                    prop_oneof![
+                        9 => (0u64..100, prop_oneof![Just(0u64), Just(999u64), 0u64..1000])
+                            .prop_map(|(s, ms)| (base() + s) * 1000 + ms),
+                        1 => Just(0u64),
+                    ],
+                )
                     .prop_map(|(session, since)| Op::NewestSince { session, since }),
             ]
         }
@@ -718,6 +835,10 @@ mod tests {
             let ts = match e.stamp {
                 Stamp::At(offset) => {
                     format!("2026-08-09T12:{:02}:{:02}Z", offset / 60, offset % 60)
+                }
+                Stamp::AtMs(offset) => {
+                    let (s, ms) = (offset / 1000, offset % 1000);
+                    format!("2026-08-09T12:{:02}:{:02}.{ms:03}Z", s / 60, s % 60)
                 }
                 Stamp::Empty => String::new(),
                 Stamp::Garbage => "yesterday-ish".into(),
@@ -741,6 +862,14 @@ mod tests {
                     Kind::Prompt { text }
                 },
             }
+        }
+
+        /// The exact end, in epoch milliseconds, of a turn stamped to the
+        /// millisecond; `None` for anything coarser.
+        fn exact_ms(event: &Event) -> Option<u64> {
+            let (_, fraction) = event.ts.split_once('.')?;
+            let ms: u64 = fraction.strip_suffix('Z')?.parse().ok()?;
+            Some(event::iso_to_epoch(&event.ts)? * 1000 + ms)
         }
 
         fn generation_of(record: &Value) -> u64 {
@@ -772,10 +901,16 @@ mod tests {
                             .collect();
                         for event in &batch {
                             if let Kind::TurnEnd { result, .. } = &event.kind {
+                                let epoch = event::iso_to_epoch(&event.ts).unwrap_or(*now);
+                                let latest_ms = match exact_ms(event) {
+                                    Some(ms) => ms,
+                                    None => epoch * 1000 + 999,
+                                };
                                 log.push(Reference {
                                     generation: log.len() as u64 + 1,
                                     session: event.session.clone(),
-                                    epoch: event::iso_to_epoch(&event.ts).unwrap_or(*now),
+                                    epoch,
+                                    latest_ms,
                                     marker: result.clone().unwrap(),
                                 });
                             }
@@ -855,10 +990,10 @@ mod tests {
                         let newest = log
                             .iter()
                             .rev()
-                            .find(|r| r.session == session && r.epoch >= *since);
+                            .find(|r| r.session == session && r.latest_ms >= *since);
                         let pruned_since = log
                             .iter()
-                            .any(|r| r.generation < floor && r.epoch >= *since);
+                            .any(|r| r.generation < floor && r.epoch >= *since / 1000);
                         match (newest, got) {
                             (Some(newest), Lookup::Found(found)) => {
                                 prop_assert!(
@@ -887,7 +1022,7 @@ mod tests {
                                     .records
                                     .first()
                                     .and_then(record_epoch)
-                                    .is_some_and(|first| *since >= first);
+                                    .is_some_and(|first| *since / 1000 >= first);
                                 if older_first {
                                     seen.since_pruned_behind_older.fetch_add(1, Relaxed);
                                 }
