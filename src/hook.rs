@@ -249,30 +249,60 @@ fn cmdline(pid: u32) -> String {
         .unwrap_or_default()
 }
 
+/// The process a hook ran under.
+#[derive(Debug, PartialEq, Eq)]
+enum Agent {
+    /// The agent process itself, one per session.
+    Own(u32),
+    /// A process serving many sessions at once: codex's app-server, which
+    /// since 0.159 runs every TUI's turns (and so its hooks) in one shared
+    /// daemon. Its pid names no session, so it is recorded as the host and
+    /// the session is bound to a client later, by `query`.
+    Host(u32),
+    Unknown,
+}
+
 /// Walk up to the agent process itself. Recording its pid, paired with its
 /// start time, is what lets the observer decide staleness exactly — the mapping
 /// holds while that exact process lives — rather than with a timeout.
-fn agent_pid() -> u32 {
+fn agent_pid() -> Agent {
     let mut pid = std::os::unix::process::parent_id();
+    let mut ancestry = Vec::new();
     for _ in 0..8 {
         let c = cmdline(pid);
         if c.is_empty() {
             break;
         }
-        let names_agent = ["claude", "codex", "opencode", "agy"]
-            .iter()
-            .any(|n| c.contains(n));
-        // Skip our own command line, which names an agent only because this
-        // binary is invoked from an agent's hook configuration.
-        if names_agent && !c.contains("agentbus") {
-            return pid;
-        }
+        ancestry.push((pid, c));
         match ppid_of(pid) {
             Some(p) if p != 0 && p != pid => pid = p,
             _ => break,
         }
     }
-    0
+    classify(&ancestry)
+}
+
+/// The first agent in a hook's ancestry, nearest first.
+///
+/// A host ends the walk rather than being stepped over. Whatever is above
+/// the daemon is the TUI that happened to start it, which is one client of
+/// many and usually not the one whose turn this is (bn-3c9).
+fn classify(ancestry: &[(u32, String)]) -> Agent {
+    for (pid, c) in ancestry {
+        let names_agent = ["claude", "codex", "opencode", "agy"]
+            .iter()
+            .any(|n| c.contains(n));
+        // Skip our own command line, which names an agent only because this
+        // binary is invoked from an agent's hook configuration.
+        if !names_agent || c.contains("agentbus") {
+            continue;
+        }
+        if c.contains("codex") && c.split(' ').any(|arg| arg == "app-server") {
+            return Agent::Host(*pid);
+        }
+        return Agent::Own(*pid);
+    }
+    Agent::Unknown
 }
 
 fn register_session(p: &Value, register: &Path, inbox: &Path, spool: &Path) {
@@ -310,17 +340,45 @@ fn register_session(p: &Value, register: &Path, inbox: &Path, spool: &Path) {
     // and the transcript path is the only route to a session's subagent
     // sidecars. Returning early on an unrecognised host threw all of that away
     // to say nothing more than "I do not know where this is".
-    let (mux, mux_session, pane) = location();
-    let pid = agent_pid();
-    let line = json!({
+    let agent = agent_pid();
+    // A host's environment, and so its pane, is inherited from whichever TUI
+    // started it, not from the one whose session this is.
+    let (mux, mux_session, pane) = match agent {
+        Agent::Host(_) => Default::default(),
+        _ => location(),
+    };
+    let mut line = json!({
         "session_id": session,
         "transcript": first(p, TRANSCRIPT_KEYS),
         "mux": mux,
         "mux_session": mux_session,
         "pane": pane,
-        "pid": pid,
-        "starttime": starttime(pid),
     });
+    let fields = line.as_object_mut().expect("a JSON object");
+    match agent {
+        Agent::Own(pid) => {
+            fields.insert("pid".into(), json!(pid));
+            fields.insert("starttime".into(), json!(starttime(pid)));
+        }
+        Agent::Host(pid) => {
+            fields.insert("pid".into(), json!(0));
+            fields.insert("starttime".into(), json!(0));
+            fields.insert("host_pid".into(), json!(pid));
+            fields.insert("host_starttime".into(), json!(starttime(pid)));
+            // When this was, in the unit of a process start time. A client
+            // that started after it cannot own the session, which is how
+            // `query` tells a TUI's session from an older one in the same
+            // directory.
+            fields.insert(
+                "registered_tick".into(),
+                json!(starttime(std::process::id())),
+            );
+        }
+        Agent::Unknown => {
+            fields.insert("pid".into(), json!(0));
+            fields.insert("starttime".into(), json!(0));
+        }
+    }
     publish(spool, "register", register, line);
 }
 
@@ -376,8 +434,12 @@ fn subagent(p: &Value, phase: Option<&str>, inbox: &Path, spool: &Path) {
 /// OpenCode, whose plugin API sees transitions that reach no transcript.
 fn state(p: &Value, st: Option<&str>, detail: Option<&String>, inbox: &Path, spool: &Path) {
     let Some(st) = st else { return };
-    let (mux, mux_session, pane) = location();
-    let pid = agent_pid();
+    // A host's pane is not this session's; see `register_session`.
+    let (pid, (mux, mux_session, pane)) = match agent_pid() {
+        Agent::Own(pid) => (pid, location()),
+        Agent::Host(_) => (0, Default::default()),
+        Agent::Unknown => (0, location()),
+    };
     // Such an agent has no transcript and therefore no session id of its own.
     // Synthesising one from the pane keeps it a first-class row without
     // pretending it was observed — but that needs a pane to name it after, so a
@@ -640,6 +702,51 @@ mod tests {
             dir.join("register.jsonl"),
             dir.join("inbox.jsonl"),
         )
+    }
+
+    fn ancestry(lines: &[&str]) -> Vec<(u32, String)> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (100 + i as u32, c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_hook_under_codex_itself_registers_that_process() {
+        let chain = ancestry(&[
+            "/bin/sh -c /home/u/.local/bin/agentbus hook register",
+            "/home/u/.codex/bin/codex --sandbox read-only",
+            "vessel server",
+        ]);
+        assert_eq!(classify(&chain), Agent::Own(101));
+        assert_eq!(classify(&ancestry(&["claude --resume"])), Agent::Own(100));
+        assert_eq!(classify(&ancestry(&["bash", "init"])), Agent::Unknown);
+    }
+
+    /// bn-3c9. A hook run by codex's shared app-server registers it as the
+    /// host, and never the TUI that happened to start it.
+    #[test]
+    fn a_hook_under_the_shared_app_server_registers_it_as_host() {
+        let daemon = "/home/u/.codex/packages/standalone/releases/0.159.2/bin/codex \
+                      app-server --listen unix:// --managed-daemon";
+        assert_eq!(
+            classify(&ancestry(&[
+                "/bin/sh -c agentbus hook register",
+                daemon,
+                "systemd --user"
+            ])),
+            Agent::Host(101)
+        );
+        assert_eq!(
+            classify(&ancestry(&[daemon, "codex --model x", "vessel server"])),
+            Agent::Host(100)
+        );
+        // Named `app-server` only as part of a longer word, or not by codex.
+        assert_eq!(
+            classify(&ancestry(&["codex --profile my-app-server"])),
+            Agent::Own(100)
+        );
     }
 
     #[test]

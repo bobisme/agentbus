@@ -66,6 +66,14 @@ pub struct Pane {
     pub pid: u64,
     /// Process start time, which makes the pid unambiguous across reuse.
     pub starttime: u64,
+    /// A process serving many sessions, set instead of `pid` when the hook ran
+    /// under one (codex's shared app-server). Nonzero `pid` and `host_pid`
+    /// never coexist.
+    pub host_pid: u64,
+    pub host_starttime: u64,
+    /// When the hook registered this session, in clock ticks since boot, the
+    /// unit of a process start time. Only recorded for a hosted session.
+    pub registered_tick: u64,
 }
 
 /// Read every registration, newest wins. Re-read in full rather than tailed:
@@ -86,6 +94,7 @@ pub fn load(path: &Path) -> BTreeMap<String, Pane> {
                 .unwrap_or_default()
                 .to_string()
         };
+        let number = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
         let session = s("session_id");
         if session.is_empty() {
             continue;
@@ -97,8 +106,11 @@ pub fn load(path: &Path) -> BTreeMap<String, Pane> {
                 mux_session: s("mux_session"),
                 pane: s("pane"),
                 transcript: s("transcript"),
-                pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
-                starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),
+                pid: number("pid"),
+                starttime: number("starttime"),
+                host_pid: number("host_pid"),
+                host_starttime: number("host_starttime"),
+                registered_tick: number("registered_tick"),
             },
         );
     }
@@ -145,21 +157,31 @@ pub fn still_true(p: &Pane) -> bool {
 /// a system-wide claim that an agent is running. Zombies are no longer agents
 /// either, even though their `/proc` entry has not yet been reaped.
 pub fn exactly_live(p: &Pane) -> bool {
-    if p.pid == 0 || p.starttime == 0 {
+    process_is(p.pid, p.starttime)
+}
+
+/// `exactly_live` for the host a session was registered under. A live host
+/// says the session can still be served, not that anyone is attached to it.
+pub fn host_live(p: &Pane) -> bool {
+    process_is(p.host_pid, p.host_starttime)
+}
+
+fn process_is(pid: u64, starttime: u64) -> bool {
+    if pid == 0 || starttime == 0 {
         return false;
     }
-    let Ok(txt) = std::fs::read_to_string(format!("/proc/{}/stat", p.pid)) else {
+    let Ok(txt) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
     parse_stat(&txt)
-        .map(|(state, starttime)| state != 'Z' && starttime == p.starttime)
+        .map(|(state, started)| state != 'Z' && started == starttime)
         .unwrap_or(false)
 }
 
 /// `/proc/<pid>/stat` has a parenthesized command that may itself contain
 /// spaces and parentheses, so fixed fields can only be counted after the last
 /// `)`. Returns process state (field 3) and start time (field 22).
-fn parse_stat(txt: &str) -> Option<(char, u64)> {
+pub(crate) fn parse_stat(txt: &str) -> Option<(char, u64)> {
     let rest = txt.rsplit_once(')')?.1;
     let mut fields = rest.split_whitespace();
     let state = fields.next()?.chars().next()?;

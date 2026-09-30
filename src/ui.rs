@@ -2,8 +2,9 @@
 //!
 //! The daemon still renders nothing. This is a short-lived reader, like
 //! `sessions` and `wait`, with one crucial default: only process-verified
-//! sessions are shown. Transcript history and stale hook reports remain
-//! available behind `--all` / `a`, but cannot masquerade as running agents.
+//! sessions, and sessions served by a live shared host, are shown. Transcript
+//! history and stale hook reports remain available behind `--all` / `a`, but
+//! cannot masquerade as running agents.
 
 use crate::query::{self, Locations, Presence, Session};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -214,12 +215,14 @@ impl App {
     }
 }
 
-/// Select one canonical row per verified process.
+/// Select one canonical row per verified process, and every hosted session.
 ///
 /// A hook-only identity can coexist with the real transcript-backed session
 /// for the same exact pid. Both are useful raw records, but rendering both says
 /// two agents are running when only one process exists. Unverified records have
-/// no exact identity and therefore are never guessed together.
+/// no exact identity and therefore are never guessed together. Hosted sessions
+/// share their host's process by design, one per codex client, so each is its
+/// own row.
 fn visible_indices(sessions: &[Session], show_all: bool) -> Vec<usize> {
     let mut by_process: BTreeMap<(u64, u64), usize> = BTreeMap::new();
     for (i, session) in sessions.iter().enumerate() {
@@ -240,7 +243,9 @@ fn visible_indices(sessions: &[Session], show_all: bool) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(i, session)| {
-            canonical.contains(i) || (show_all && session.presence() == Presence::Unverified)
+            canonical.contains(i)
+                || session.presence() == Presence::Hosted
+                || (show_all && session.presence() == Presence::Unverified)
         })
         .map(|(i, _)| i)
         .collect()
@@ -267,7 +272,8 @@ fn compare_sessions(a: &Session, b: &Session) -> Ordering {
 fn presence_rank(s: &Session) -> u8 {
     match s.presence() {
         Presence::Verified => 0,
-        Presence::Unverified => 1,
+        Presence::Hosted => 1,
+        Presence::Unverified => 2,
     }
 }
 
@@ -311,7 +317,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             format!("{} idle", count_state("idle")),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::raw(format!("   {verified} verified · {hidden} unverified")),
+        Span::raw(format!("   {verified} live · {hidden} unverified")),
     ];
     if !app.error.is_empty() {
         header_spans.push(Span::styled(
@@ -373,10 +379,9 @@ fn session_item(s: &Session, compact: bool) -> ListItem<'static> {
         .find(|v| !v.is_empty())
         .unwrap_or("untitled");
     let label = clean(label);
-    let presence = if s.presence() == Presence::Verified {
-        String::new()
-    } else {
-        "  unverified".to_string()
+    let presence = match s.presence() {
+        Presence::Verified => String::new(),
+        other => format!("  {}", other.label()),
     };
     let mut lines = vec![Line::from(vec![
         Span::styled(format!(" {glyph} "), Style::default().fg(color)),
@@ -606,6 +611,7 @@ mod tests {
                 "cwd": "/tmp/work",
                 "location": {"mux": "zellij", "session": "main", "pane": location},
             }),
+            ..Default::default()
         }
     }
 
@@ -630,6 +636,7 @@ mod tests {
             starttime: 7,
             transcript: String::new(),
             state: json!({"source": "hook", "state": "", "location": {}}),
+            ..Default::default()
         };
         let rich = Session {
             id: "real-row".into(),
@@ -637,6 +644,7 @@ mod tests {
             starttime: 7,
             transcript: "/tmp/transcript.jsonl".into(),
             state: json!({"source": "codex", "state": "working", "location": {}}),
+            ..Default::default()
         };
         let sessions = [thin, rich];
         let visible = visible_indices(&sessions, false);

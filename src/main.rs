@@ -65,6 +65,8 @@ ASKING:
 
     --pid matches the named process or any descendant of it, so a supervisor
     can pass the pid it spawned without knowing that codex runs behind a shim.
+    A codex session run by the shared app-server (codex 0.159+) is matched
+    through the codex client under that pid, by its working directory.
 
     wait blocks until the current-or-next turn ends. It never reports a turn
     that ended before it started, so a caller that submits first should mark
@@ -788,6 +790,7 @@ fn inbox_events(v: &serde_json::Value, panes: &mut BTreeMap<String, register::Pa
                 transcript: String::new(),
                 pid: v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0),
                 starttime: v.get("starttime").and_then(|x| x.as_u64()).unwrap_or(0),
+                ..Default::default()
             },
         );
     }

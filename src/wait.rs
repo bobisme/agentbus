@@ -273,8 +273,9 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
                 return ERR;
             }
             Some(Resolved::One(s)) => break s.id.clone(),
-            // Ambiguity is the caller's to resolve and will not clear itself.
-            Some(r @ Resolved::Many(_)) => {
+            // Ambiguity is the caller's to resolve and will not clear itself,
+            // and neither will a pid that cannot name a session.
+            Some(r @ (Resolved::Many(_) | Resolved::Unbindable(_))) => {
                 eprintln!("agentbus: {}", query::describe_miss(&a.filter, &r));
                 return ERR;
             }
@@ -502,6 +503,152 @@ mod tests {
 
     fn write_snapshot(loc: &Locations, sessions: &str) {
         std::fs::write(&loc.snapshot, format!(r#"{{"sessions":{sessions}}}"#)).unwrap();
+    }
+
+    fn stat_starttime(pid: u64) -> u64 {
+        let txt = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        crate::register::parse_stat(&txt).unwrap().1
+    }
+
+    /// `bin 60` running in `cwd`, killed on drop. Through a symlink named
+    /// `codex` it is a codex client as far as `/proc` can tell.
+    struct Sleeper(std::process::Child);
+
+    impl Sleeper {
+        fn spawn(bin: &std::path::Path, cwd: &std::path::Path) -> Self {
+            let child = std::process::Command::new(bin)
+                .arg("60")
+                .current_dir(cwd)
+                .spawn()
+                .unwrap();
+            Self(child)
+        }
+
+        fn pid(&self) -> u64 {
+            u64::from(self.0.id())
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// bn-3c9. Codex 0.159 runs every client's hooks in one shared
+    /// app-server, so each session registers that host rather than its own
+    /// client. Two clients in their own directories under one live host (a
+    /// process of its own, as the daemon is), plus an older session in the first
+    /// client's directory from before that client started: `--pid` of each
+    /// client finds its own session, and the host's pid is refused at once.
+    #[test]
+    fn pid_binds_each_client_of_a_shared_host_to_its_own_session() {
+        let loc = fixture("shared-host");
+        let root = loc.snapshot.parent().unwrap().to_path_buf();
+        let (dir_a, dir_b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let codex = root.join("codex");
+        std::os::unix::fs::symlink("/bin/sleep", &codex).unwrap();
+        let (a, b) = (
+            Sleeper::spawn(&codex, &dir_a),
+            Sleeper::spawn(&codex, &dir_b),
+        );
+        // Let both exec before /proc is read for their command lines.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while [a.pid(), b.pid()].iter().any(|pid| {
+            !std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|c| c.starts_with(codex.as_os_str().as_encoded_bytes()))
+        }) {
+            assert!(Instant::now() < deadline, "fake clients never exec'd");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let daemon = Sleeper::spawn(std::path::Path::new("/bin/sleep"), &root);
+        let host = daemon.pid();
+        let host_start = stat_starttime(host);
+        let register = |session: &str, tick: u64| {
+            json!({
+                "session_id": session,
+                "pid": 0,
+                "starttime": 0,
+                "host_pid": host,
+                "host_starttime": host_start,
+                "registered_tick": tick,
+            })
+            .to_string()
+        };
+        let (start_a, start_b) = (stat_starttime(a.pid()), stat_starttime(b.pid()));
+        std::fs::write(
+            &loc.register,
+            [
+                register("old-a", start_a - 1),
+                register("sa", start_a),
+                register("sb", start_b + 1),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let (a_dir, b_dir) = (dir_a.display(), dir_b.display());
+        write_snapshot(
+            &loc,
+            &format!(
+                r#"[{{"session":"old-a","state":"idle","cwd":"{a_dir}"}},
+                    {{"session":"sa","state":"working","cwd":"{a_dir}"}},
+                    {{"session":"sb","state":"working","cwd":"{b_dir}"}}]"#
+            ),
+        );
+
+        let resolve = |pid: u64| {
+            let filter = Filter {
+                pid: Some(pid),
+                ..Filter::default()
+            };
+            match query::resolve_one(&loc, &filter) {
+                Some(Resolved::One(s)) => {
+                    assert_eq!(s.presence(), query::Presence::Hosted);
+                    s.id.clone()
+                }
+                Some(r) => format!("miss: {}", query::describe_miss(&filter, &r)),
+                None => "no snapshot".into(),
+            }
+        };
+        assert_eq!(resolve(a.pid()), "sa");
+        assert_eq!(resolve(b.pid()), "sb");
+        assert!(
+            resolve(host).contains("shared app-server"),
+            "{}",
+            resolve(host)
+        );
+
+        // And `wait` on each gets its own session's answer, or none.
+        let mut index = Index::default();
+        index.push_events(
+            &[Event {
+                ts: "2026-08-09T12:00:00Z".into(),
+                source: "test",
+                session: "sa".into(),
+                kind: Kind::TurnEnd {
+                    duration_ms: Some(7),
+                    result: Some("a's answer".into()),
+                    result_full: Some("a's answer".into()),
+                },
+            }],
+            crate::event::iso_to_epoch("2026-08-09T12:00:01Z").unwrap(),
+        );
+        assert!(index.write_atomic(&loc.completions));
+        let wait = |pid: u64| {
+            run(
+                &args(&["--pid", &pid.to_string(), "--since", "0", "--timeout", "0"]),
+                &loc,
+            )
+        };
+        assert_eq!(wait(a.pid()), OK);
+        assert_eq!(wait(b.pid()), TIMEOUT);
+        let started = Instant::now();
+        assert_eq!(wait(host), ERR);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     fn outcome(status: &'static str) -> Outcome {

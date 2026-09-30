@@ -112,7 +112,7 @@ pub fn resolve(state_dir: &Path, pinned: &Locations, pinned_snapshot: bool) -> L
 
 /// One session as the query verbs report it: what the snapshot knows about its
 /// state, plus what the register knows about where and what process it is.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Session {
     pub id: String,
     /// The snapshot's object for this session, passed through whole.
@@ -121,6 +121,13 @@ pub struct Session {
     /// Nonzero only with `pid`, after exact pid/start-time verification.
     pub starttime: u64,
     pub transcript: String,
+    /// The shared process serving this session, when a hook ran under one
+    /// rather than under the agent (codex's app-server). Nonzero only while
+    /// that exact process lives, and then `pid` is 0: the host names no
+    /// session, so this one is found by `--pid` only through `Client`.
+    pub host_pid: u64,
+    /// When the session last registered, in clock ticks since boot.
+    pub registered_tick: u64,
 }
 
 /// How confidently this record describes a process that exists right now.
@@ -132,6 +139,9 @@ pub struct Session {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
     Verified,
+    /// Served by a live shared host. The session can still take a turn, but
+    /// no process of its own proves anyone is attached to it.
+    Hosted,
     Unverified,
 }
 
@@ -139,6 +149,7 @@ impl Presence {
     pub fn label(self) -> &'static str {
         match self {
             Presence::Verified => "verified",
+            Presence::Hosted => "hosted",
             Presence::Unverified => "unverified",
         }
     }
@@ -148,6 +159,8 @@ impl Session {
     pub fn presence(&self) -> Presence {
         if self.pid > 0 && self.starttime > 0 {
             Presence::Verified
+        } else if self.host_pid > 0 {
+            Presence::Hosted
         } else {
             Presence::Unverified
         }
@@ -199,6 +212,7 @@ pub fn all(loc: &Locations) -> Option<Vec<Session>> {
                     .to_string();
                 let reg = regs.get(&id);
                 let live = reg.map(register::exactly_live).unwrap_or(false);
+                let hosted = reg.filter(|p| register::host_live(p));
                 Session {
                     id,
                     state: s.clone(),
@@ -208,6 +222,8 @@ pub fn all(loc: &Locations) -> Option<Vec<Session>> {
                     pid: reg.filter(|_| live).map(|p| p.pid).unwrap_or(0),
                     starttime: reg.filter(|_| live).map(|p| p.starttime).unwrap_or(0),
                     transcript: reg.map(|p| p.transcript.clone()).unwrap_or_default(),
+                    host_pid: hosted.map(|p| p.host_pid).unwrap_or(0),
+                    registered_tick: hosted.map(|p| p.registered_tick).unwrap_or(0),
                 }
             })
             .collect(),
@@ -256,6 +272,90 @@ pub fn is_self_or_descendant(pid: u64, ancestor: u64) -> bool {
     false
 }
 
+/// A codex client at or below a queried pid: the TUI a supervisor spawned,
+/// or the binary behind the shim it spawned.
+///
+/// Since codex 0.159 a client's turns, and so its hooks, run in the shared
+/// app-server, and nothing a hook can see names the client (bn-3c9). What
+/// ties one to its session is where it runs and when: the session's working
+/// directory is the client's, and it registered after the client started. A
+/// supervisor that gives each agent a directory of its own, which concurrent
+/// agents need anyway, gets an exact binding; two clients in one directory
+/// are ambiguous and reported as such, never guessed between.
+#[derive(Debug)]
+struct Client {
+    pid: u64,
+    /// `None` when /proc will not say, which makes the binding impossible
+    /// and is reported rather than waited on.
+    cwd: Option<PathBuf>,
+    starttime: u64,
+}
+
+impl Client {
+    fn serves(&self, s: &Session) -> bool {
+        let Some(cwd) = &self.cwd else {
+            return false;
+        };
+        s.host_pid > 0
+            && s.registered_tick >= self.starttime
+            && same_dir(field(s, "cwd"), &cwd.to_string_lossy())
+    }
+}
+
+/// Is this command line a codex client, as opposed to the shared host or one
+/// of codex's own helpers (`codex-code-mode-host`, plugin servers)? The real
+/// binary is `codex` itself; the npm shim is an interpreter running a script
+/// named `codex`.
+fn is_codex_client(args: &[&str]) -> bool {
+    let named = |i: usize| {
+        args.get(i)
+            .is_some_and(|a| Path::new(a).file_name().is_some_and(|n| n == "codex"))
+    };
+    (named(0) || named(1)) && !args.contains(&"app-server")
+}
+
+fn cmdline_args(pid: u64) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// Every codex client that is `ancestor` or a descendant of it.
+fn clients_under(ancestor: u64) -> Vec<Client> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(cmdline) = cmdline_args(pid) else {
+            continue;
+        };
+        let args: Vec<&str> = cmdline.split('\0').filter(|a| !a.is_empty()).collect();
+        if !is_codex_client(&args) || !is_self_or_descendant(pid, ancestor) {
+            continue;
+        }
+        let Some(starttime) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|txt| register::parse_stat(&txt))
+            .map(|(_, starttime)| starttime)
+        else {
+            continue;
+        };
+        out.push(Client {
+            pid,
+            cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok(),
+            starttime,
+        });
+    }
+    out
+}
+
 /// Same directory, tolerating the trailing-slash and symlink differences
 /// between what an agent recorded and what a caller typed.
 fn same_dir(a: &str, b: &str) -> bool {
@@ -284,7 +384,7 @@ impl Filter {
         self.pid.is_none() && self.session.is_none() && self.cwd.is_none()
     }
 
-    fn matches(&self, s: &Session) -> bool {
+    fn matches(&self, s: &Session, clients: &[Client]) -> bool {
         if let Some(want) = &self.session {
             // Prefix rather than equality would be wrong here: codex session ids
             // are UUIDv7, so two created seconds apart share a long prefix and a
@@ -294,7 +394,7 @@ impl Filter {
             }
         }
         if let Some(want) = self.pid {
-            if !is_self_or_descendant(s.pid, want) {
+            if !is_self_or_descendant(s.pid, want) && !clients.iter().any(|c| c.serves(s)) {
                 return false;
             }
         }
@@ -308,8 +408,45 @@ impl Filter {
     }
 }
 
-pub fn matching(loc: &Locations, f: &Filter) -> Option<Vec<Session>> {
-    Some(all(loc)?.into_iter().filter(|s| f.matches(s)).collect())
+/// The sessions `f` matches, and whatever made `--pid` unanswerable if it
+/// matched none: a lookup that cannot succeed says so at once rather than
+/// leaving a caller to wait out its timeout.
+fn select(sessions: Vec<Session>, f: &Filter) -> (Vec<Session>, Option<String>) {
+    // Reading /proc for clients is only worth it when some session is hosted.
+    let clients = match f.pid {
+        Some(want) if sessions.iter().any(|s| s.host_pid > 0) => clients_under(want),
+        _ => Vec::new(),
+    };
+    let hosts: Vec<u64> = sessions
+        .iter()
+        .map(|s| s.host_pid)
+        .filter(|&h| h > 0)
+        .collect();
+    let found: Vec<Session> = sessions
+        .into_iter()
+        .filter(|s| f.matches(s, &clients))
+        .collect();
+    let why = match f.pid {
+        Some(want) if found.is_empty() => unbindable(want, &hosts, &clients),
+        _ => None,
+    };
+    (found, why)
+}
+
+fn unbindable(want: u64, hosts: &[u64], clients: &[Client]) -> Option<String> {
+    if hosts.contains(&want) {
+        return Some(format!(
+            "pid {want} is codex's shared app-server, which serves every codex \
+             session; pass the pid of the codex client, or use --session or --cwd"
+        ));
+    }
+    let blind = clients.iter().find(|c| c.cwd.is_none())?;
+    Some(format!(
+        "codex client {} under pid {want} runs its sessions in the shared \
+         app-server, so --pid finds them by the client's directory, and that \
+         cannot be read; use --session or --cwd",
+        blind.pid
+    ))
 }
 
 /// Exactly one session, for the verbs that act on a single one.
@@ -321,12 +458,14 @@ pub enum Resolved {
     One(Box<Session>),
     None,
     Many(usize),
+    /// Nothing matched, and nothing will: the reason why.
+    Unbindable(String),
 }
 
 pub fn resolve_one(loc: &Locations, f: &Filter) -> Option<Resolved> {
-    let mut found = matching(loc, f)?;
+    let (mut found, why) = select(all(loc)?, f);
     Some(match found.len() {
-        0 => Resolved::None,
+        0 => why.map_or(Resolved::None, Resolved::Unbindable),
         1 => Resolved::One(Box::new(found.remove(0))),
         n => Resolved::Many(n),
     })
@@ -353,13 +492,18 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
         i += 1;
     }
 
-    let Some(found) = matching(loc, &f) else {
+    let Some(sessions) = all(loc) else {
         eprintln!(
             "agentbus: no snapshot at {}; is the observer running?",
             loc.snapshot.display()
         );
         return 1;
     };
+    let (found, why) = select(sessions, &f);
+    if let Some(why) = why {
+        eprintln!("agentbus: {why}");
+        return 1;
+    }
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -375,6 +519,9 @@ pub fn run(args: &[String], loc: &Locations) -> i32 {
                     // is the agent I spawned" rather than inferring it.
                     o.insert("pid".into(), json!(s.pid));
                     o.insert("transcript".into(), json!(s.transcript));
+                    if s.host_pid > 0 {
+                        o.insert("host_pid".into(), json!(s.host_pid));
+                    }
                 }
                 v
             })
@@ -432,6 +579,7 @@ pub fn describe_miss(f: &Filter, r: &Resolved) -> String {
         Resolved::Many(n) => {
             format!("{n} sessions matched {what}; narrow it with --session")
         }
+        Resolved::Unbindable(why) => why.clone(),
         Resolved::One(_) => String::new(),
     }
 }
@@ -479,6 +627,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_clients_are_the_binary_or_its_shim_and_never_the_host() {
+        assert!(is_codex_client(&["codex", "--sandbox", "read-only"]));
+        assert!(is_codex_client(&["/home/u/.codex/bin/codex"]));
+        assert!(is_codex_client(&[
+            "node",
+            "/usr/lib/node_modules/.bin/codex"
+        ]));
+        assert!(!is_codex_client(&[
+            "/x/codex",
+            "app-server",
+            "--managed-daemon"
+        ]));
+        assert!(!is_codex_client(&["/x/codex-code-mode-host"]));
+        assert!(!is_codex_client(&["node", "/x/.codex/plugins/server.mjs"]));
+        assert!(!is_codex_client(&[]));
+    }
+
+    #[test]
     fn trailing_slash_is_the_same_dir() {
         assert!(same_dir("/home/x", "/home/x/"));
         assert!(!same_dir("/home/x", "/home/y"));
@@ -493,6 +659,7 @@ mod tests {
             pid: 0,
             starttime: 0,
             transcript: String::new(),
+            ..Default::default()
         };
         assert_eq!(s.presence(), Presence::Unverified);
         s.pid = 42;

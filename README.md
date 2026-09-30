@@ -203,6 +203,19 @@ registration holds the real binary one level below. For claude the two coincide,
 which is what makes this an easy bug to ship: it works until it is pointed at
 codex.
 
+**Since codex 0.159 there is no codex process per session to register.** Every
+TUI hands its turns to one shared `codex app-server` daemon, which runs the
+hooks, and nothing a hook can see names the TUI. So a hook under the daemon
+records it as the session's *host*: `sessions` shows such a session as
+`hosted`, with pid 0. `--pid N` then finds it through the codex client at or
+below N: the session whose cwd is that client's, registered after the client
+started. That is exact when each agent has its own directory, which concurrent
+agents need anyway. Two sessions that fit, such as two clients in one
+directory, or one client that started a second thread, fail as ambiguous (exit
+1). They are never guessed between. `--pid` of the daemon itself also fails
+at once, and so does a client whose cwd cannot be read, instead of waiting out
+the timeout.
+
 **`wait` blocks until the current-or-next turn ends** and prints the full answer
 on stdout, or `{status, session, result, duration_ms}` with `--json`. It exits
 `0` done, `3` blocked, `4` timeout, `1` for resolution, observer, or retained
